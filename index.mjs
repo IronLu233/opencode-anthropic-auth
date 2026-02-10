@@ -461,6 +461,75 @@ function formatSwitchReason(status, reason) {
   return "rate-limited";
 }
 
+/**
+ * Format a duration into a compact human-readable string.
+ * @param {number} ms
+ * @returns {string}
+ */
+function formatDurationShort(ms) {
+  const seconds = Math.max(1, Math.ceil(ms / 1000));
+  if (seconds < 60) return `${seconds}s`;
+
+  const minutes = Math.ceil(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+
+  const hours = Math.ceil(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+
+  const days = Math.ceil(hours / 24);
+  return `${days}d`;
+}
+
+/**
+ * Build a diagnostic reason when no account can be selected.
+ * @param {import('./lib/accounts.mjs').AccountManager} accountManager
+ * @param {Set<number>} transientRefreshSkips
+ * @param {unknown} lastError
+ * @returns {string}
+ */
+function buildNoAvailableAccountReason(accountManager, transientRefreshSkips, lastError) {
+  const now = Date.now();
+  const accounts = accountManager.getAccountsSnapshot();
+  const enabled = accounts.filter((acc) => acc.enabled);
+
+  if (enabled.length === 0) {
+    return "no enabled accounts";
+  }
+
+  const transientFailures = enabled.filter((acc) => transientRefreshSkips.has(acc.index));
+  const rateLimited = enabled
+    .map((acc) => ({ acc, resetAt: acc.rateLimitResetTimes?.anthropic }))
+    .filter(
+      ({ acc, resetAt }) => !transientRefreshSkips.has(acc.index) && typeof resetAt === "number" && resetAt > now,
+    );
+
+  const parts = [];
+
+  if (rateLimited.length > 0) {
+    const nextResetMs = Math.min(...rateLimited.map(({ resetAt }) => resetAt - now));
+    parts.push(`${rateLimited.length} rate-limited (next retry in ${formatDurationShort(nextResetMs)})`);
+  }
+
+  if (transientFailures.length > 0) {
+    parts.push(`${transientFailures.length} temporarily unavailable (request failures)`);
+  }
+
+  const unclassifiedCount = enabled.length - rateLimited.length - transientFailures.length;
+  if (unclassifiedCount > 0) {
+    parts.push(`${unclassifiedCount} unavailable (unknown reason)`);
+  }
+
+  if (lastError instanceof Error && lastError.message) {
+    const compact = lastError.message.replace(/\s+/g, " ").trim();
+    if (compact) {
+      const snippet = compact.length > 140 ? `${compact.slice(0, 137)}...` : compact;
+      parts.push(`last error: ${snippet}`);
+    }
+  }
+
+  return parts.join("; ") || "all enabled accounts unavailable";
+}
+
 // ---------------------------------------------------------------------------
 // Token refresh (per-account)
 // ---------------------------------------------------------------------------
@@ -1108,8 +1177,10 @@ export async function AnthropicAuthPlugin({ client }) {
                       "No enabled Anthropic accounts available. Enable one with 'opencode-anthropic-auth enable <N>'.",
                     );
                   }
-                  // All accounts excluded (transient refresh failures) — give up
-                  throw new Error("No available Anthropic account for request.");
+                  // Enabled accounts exist, but none are currently selectable.
+                  const reason = buildNoAvailableAccountReason(accountManager, transientRefreshSkips, lastError);
+                  await toast(`All Anthropic accounts unavailable: ${reason}`, "error");
+                  throw new Error(`No available Anthropic account for request: ${reason}`);
                 }
 
                 // Determine access token

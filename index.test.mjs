@@ -1020,6 +1020,42 @@ describe("fetch interceptor — account exhaustion", () => {
     ).rejects.toThrow(/Token refresh failed|No available Anthropic account|All accounts exhausted/);
   });
 
+  it("includes a reason in toast/error when all enabled accounts are unavailable", async () => {
+    const now = Date.now();
+    loadAccounts.mockResolvedValue(
+      makeAccountsData([
+        { refreshToken: "refresh-1", rateLimitResetTimes: { anthropic: now + 30_000 } },
+        { refreshToken: "refresh-2", rateLimitResetTimes: { anthropic: now + 45_000 } },
+      ]),
+    );
+
+    const plugin = await AnthropicAuthPlugin({ client });
+    const getAuth = vi.fn().mockResolvedValue({
+      type: "oauth",
+      refresh: "refresh-1",
+      access: "access-1",
+      expires: Date.now() + 3600_000,
+    });
+    const result = await plugin.auth.loader(getAuth, makeProvider());
+
+    await expect(
+      result.fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        body: JSON.stringify({ messages: [] }),
+      }),
+    ).rejects.toThrow(/No available Anthropic account for request: .*rate-limited/i);
+
+    expect(mockFetch).not.toHaveBeenCalled();
+    expect(client.tui.showToast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({
+          variant: "error",
+          message: expect.stringMatching(/All Anthropic accounts unavailable: .*rate-limited/i),
+        }),
+      }),
+    );
+  });
+
   it("throws when only account gets rate-limited (no more accounts to try)", async () => {
     const fetchFn = await setupFetchFn(client);
 
