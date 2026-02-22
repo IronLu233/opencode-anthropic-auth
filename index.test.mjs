@@ -55,6 +55,8 @@ vi.stubGlobal("fetch", mockFetch);
 
 import { AnthropicAuthPlugin } from "./index.mjs";
 import { saveAccounts, loadAccounts, clearAccounts } from "./lib/storage.mjs";
+import { loadConfig, DEFAULT_CONFIG } from "./lib/config.mjs";
+import { makeAccountsData as makeFixtureAccountsData } from "./test/helpers/accounts-fixtures.mjs";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -85,32 +87,13 @@ function makeProvider() {
 }
 
 /**
- * Build a stored account object with sensible defaults.
- * Override any field by passing partial overrides.
+ * Keep this suite's refresh token shape as `refresh-N` while using shared fixtures.
  */
-function makeStoredAccount(overrides = {}) {
-  return {
-    refreshToken: "refresh-1",
-    addedAt: 1000,
-    lastUsed: 0,
-    enabled: true,
-    rateLimitResetTimes: {},
-    consecutiveFailures: 0,
-    lastFailureTime: null,
-    ...overrides,
-  };
-}
+const tokenFactory = (index) => `refresh-${index + 1}`;
 
 /** Build a stored accounts data structure with N accounts. */
 function makeAccountsData(accountOverrides = [{}], extra = {}) {
-  return {
-    version: 1,
-    accounts: accountOverrides.map((o, i) =>
-      makeStoredAccount({ refreshToken: `refresh-${i + 1}`, addedAt: (i + 1) * 1000, ...o }),
-    ),
-    activeIndex: 0,
-    ...extra,
-  };
+  return makeFixtureAccountsData(accountOverrides, extra, { tokenFactory });
 }
 
 /**
@@ -358,6 +341,18 @@ describe("slash commands", () => {
     expect(text).toContain("Anthropic Multi-Account Status");
   });
 
+  it("supports login alias for slash OAuth flow", async () => {
+    const text = await runAnthropic("ln");
+    expect(text).toContain("Anthropic OAuth");
+    expect(text).toContain("Started login flow");
+  });
+
+  it("supports reauth alias for slash OAuth flow", async () => {
+    loadAccounts.mockResolvedValue(makeAccountsData([{ refreshToken: "refresh-1", enabled: true }]));
+    const text = await runAnthropic("ra 1");
+    expect(text).toContain("Started reauth 1 flow");
+  });
+
   it("routes switch through CLI command surface", async () => {
     loadAccounts.mockResolvedValue(
       makeAccountsData([
@@ -411,6 +406,18 @@ describe("slash commands", () => {
         ]),
       }),
     );
+  });
+
+  it("rejects mismatched completion command for pending OAuth mode", async () => {
+    let text = await runAnthropic("login");
+    expect(text).toContain("Started login flow");
+
+    text = await runAnthropic("reauth complete test-code#state");
+    expect(text).toContain("Pending login OAuth flow found");
+
+    expect(saveAccounts).not.toHaveBeenCalled();
+    expect(client.auth.set).not.toHaveBeenCalled();
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it("expires pending slash OAuth flow after TTL", async () => {
@@ -517,7 +524,7 @@ describe("fetch interceptor", () => {
     fetchFn = result.fetch;
   });
 
-  it("adds Bearer auth header and required beta headers", async () => {
+  it("adds spoofed Claude Code headers by default", async () => {
     mockFetch.mockResolvedValueOnce(
       new Response('data: {"type":"message_start"}\n\n', {
         status: 200,
@@ -534,9 +541,36 @@ describe("fetch interceptor", () => {
     const [, init] = mockFetch.mock.calls[0];
     const headers = init.headers;
     expect(headers.get("authorization")).toBe("Bearer test-access");
+    expect(headers.get("accept")).toBe("application/json");
+    expect(headers.get("anthropic-version")).toBe("2023-06-01");
+    expect(headers.get("anthropic-dangerous-direct-browser-access")).toBe("true");
+    expect(headers.get("user-agent")).toBe("claude-cli/2.1.50 (external, cli)");
+    expect(headers.get("x-app")).toBe("cli");
+    expect(headers.get("x-stainless-arch")).toBe("arm64");
+    expect(headers.get("x-stainless-lang")).toBe("js");
+    expect(headers.get("x-stainless-os")).toBe("MacOS");
+    expect(headers.get("x-stainless-package-version")).toBe("0.74.0");
+    expect(headers.get("x-stainless-retry-count")).toBe("0");
+    expect(headers.get("x-stainless-runtime")).toBe("node");
+    expect(headers.get("x-stainless-runtime-version")).toBe("v24.3.0");
+    expect(headers.get("x-stainless-timeout")).toBe("600");
+    expect(headers.get("anthropic-beta")).toContain("claude-code-20250219");
     expect(headers.get("anthropic-beta")).toContain("oauth-2025-04-20");
-    expect(headers.get("user-agent")).toContain("claude-cli");
+    expect(headers.get("anthropic-beta")).not.toContain("context-management-2025-06-27");
     expect(headers.has("x-api-key")).toBe(false);
+  });
+
+  it("adds Opus-only context-management beta for opus models", async () => {
+    mockFetch.mockResolvedValueOnce(new Response("", { status: 200 }));
+
+    await fetchFn("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "claude-opus-4-1", messages: [] }),
+    });
+
+    const [, init] = mockFetch.mock.calls[0];
+    expect(init.headers.get("anthropic-beta")).toContain("context-management-2025-06-27");
   });
 
   it("adds ?beta=true to /v1/messages URL", async () => {
@@ -1403,21 +1437,7 @@ describe("auth menu actions", () => {
    * then configure readline to return a specific menu choice.
    */
   async function setupWithMenuChoice(menuChoice) {
-    loadAccounts.mockResolvedValue({
-      version: 1,
-      accounts: [
-        {
-          refreshToken: "existing-refresh",
-          addedAt: 1000,
-          lastUsed: 2000,
-          enabled: true,
-          rateLimitResetTimes: {},
-          consecutiveFailures: 0,
-          lastFailureTime: null,
-        },
-      ],
-      activeIndex: 0,
-    });
+    loadAccounts.mockResolvedValue(makeAccountsData([{ refreshToken: "existing-refresh", lastUsed: 2000 }]));
 
     const plugin = await AnthropicAuthPlugin({ client });
 
@@ -1489,21 +1509,7 @@ describe("auth menu actions", () => {
 
   it("manage action saves and returns about:blank", async () => {
     // For manage, readline returns "m" for menu, then "b" for back in manage submenu
-    loadAccounts.mockResolvedValue({
-      version: 1,
-      accounts: [
-        {
-          refreshToken: "existing-refresh",
-          addedAt: 1000,
-          lastUsed: 2000,
-          enabled: true,
-          rateLimitResetTimes: {},
-          consecutiveFailures: 0,
-          lastFailureTime: null,
-        },
-      ],
-      activeIndex: 0,
-    });
+    loadAccounts.mockResolvedValue(makeAccountsData([{ refreshToken: "existing-refresh", lastUsed: 2000 }]));
 
     const plugin = await AnthropicAuthPlugin({ client });
 
@@ -1612,6 +1618,79 @@ describe("header handling", () => {
     expect(init.headers.get("x-custom-header")).toBe("custom-value");
     // Auth headers should still be set
     expect(init.headers.get("authorization")).toBe("Bearer test-access");
+  });
+
+  it("applies config header overrides and disabled headers", async () => {
+    vi.mocked(loadConfig).mockReturnValue({
+      ...DEFAULT_CONFIG,
+      headers: {
+        ...DEFAULT_CONFIG.headers,
+        overrides: {
+          "x-app": "spoof-custom",
+          "user-agent": "claude-cli/9.9.9 (external, cli)",
+        },
+        disable: ["x-stainless-timeout"],
+      },
+    });
+
+    const plugin = await AnthropicAuthPlugin({ client });
+    const getAuth = vi.fn().mockResolvedValue({
+      type: "oauth",
+      refresh: "test-refresh",
+      access: "test-access",
+      expires: Date.now() + 3600_000,
+    });
+    const result = await plugin.auth.loader(getAuth, makeProvider());
+
+    mockFetch.mockResolvedValueOnce(new Response("", { status: 200 }));
+    await result.fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({ messages: [] }),
+    });
+
+    const [, init] = mockFetch.mock.calls[0];
+    expect(init.headers.get("x-app")).toBe("spoof-custom");
+    expect(init.headers.get("user-agent")).toBe("claude-cli/9.9.9 (external, cli)");
+    expect(init.headers.has("x-stainless-timeout")).toBe(false);
+    expect(init.headers.get("authorization")).toBe("Bearer test-access");
+  });
+
+  it("applies anthropic-beta override and merges incoming betas", async () => {
+    vi.mocked(loadConfig).mockReturnValue({
+      ...DEFAULT_CONFIG,
+      headers: {
+        ...DEFAULT_CONFIG.headers,
+        overrides: {
+          "anthropic-beta": "override-beta-1,override-beta-2",
+        },
+        disable: [],
+      },
+    });
+
+    const plugin = await AnthropicAuthPlugin({ client });
+    const getAuth = vi.fn().mockResolvedValue({
+      type: "oauth",
+      refresh: "test-refresh",
+      access: "test-access",
+      expires: Date.now() + 3600_000,
+    });
+    const result = await plugin.auth.loader(getAuth, makeProvider());
+
+    mockFetch.mockResolvedValueOnce(new Response("", { status: 200 }));
+    await result.fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "anthropic-beta": "incoming-beta-1",
+      },
+      body: JSON.stringify({ messages: [] }),
+    });
+
+    const [, init] = mockFetch.mock.calls[0];
+    const betaHeader = init.headers.get("anthropic-beta");
+    expect(betaHeader).toContain("override-beta-1");
+    expect(betaHeader).toContain("override-beta-2");
+    expect(betaHeader).toContain("incoming-beta-1");
+    expect(betaHeader).not.toContain("claude-code-20250219");
   });
 
   it("does NOT add ?beta=true to non-/v1/messages URLs", async () => {

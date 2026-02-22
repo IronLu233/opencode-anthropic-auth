@@ -5,7 +5,10 @@ import { main as cliMain } from "./cli.mjs";
 import { authorize, exchange } from "./lib/oauth.mjs";
 import { loadConfig, CLIENT_ID } from "./lib/config.mjs";
 import { loadAccounts, saveAccounts, clearAccounts, createDefaultStats } from "./lib/storage.mjs";
+import { applyOAuthCredentials, resetAccountTracking } from "./lib/account-state.mjs";
+import { resolveSlashCommandName, isDestructiveCommand, isInteractiveOnlyCommand } from "./lib/commands.mjs";
 import { isAccountSpecificError, parseRateLimitReason, parseRetryAfterHeader } from "./lib/backoff.mjs";
+import { getHeaderProfile, getDefaultBetas } from "./lib/request-headers.mjs";
 
 // ---------------------------------------------------------------------------
 // Account management CLI prompts
@@ -106,9 +109,11 @@ async function promptManageAccounts(accountManager) {
  * @param {any} input
  * @param {Record<string, any>} requestInit
  * @param {string} accessToken
+ * @param {import('./lib/config.mjs').AnthropicAuthConfig['headers']} headerConfig
+ * @param {string | undefined} modelName
  * @returns {Headers}
  */
-function buildRequestHeaders(input, requestInit, accessToken) {
+function buildRequestHeaders(input, requestInit, accessToken, headerConfig, modelName) {
   const requestHeaders = new Headers();
   if (input instanceof Request) {
     input.headers.forEach((value, key) => {
@@ -135,22 +140,70 @@ function buildRequestHeaders(input, requestInit, accessToken) {
     }
   }
 
-  // Preserve all incoming beta headers while ensuring OAuth requirements
+  // Preserve incoming beta values before profile defaults/overrides.
   const incomingBeta = requestHeaders.get("anthropic-beta") || "";
   const incomingBetasList = incomingBeta
     .split(",")
     .map((b) => b.trim())
     .filter(Boolean);
 
-  const requiredBetas = ["oauth-2025-04-20", "interleaved-thinking-2025-05-14"];
-  const mergedBetas = [...new Set([...requiredBetas, ...incomingBetasList])].join(",");
+  const profile = getHeaderProfile(headerConfig.emulation_profile);
+  const disabledHeaders = new Set(headerConfig.disable.map((name) => name.toLowerCase()));
+
+  for (const [key, value] of Object.entries(profile.headers)) {
+    if (!disabledHeaders.has(key.toLowerCase())) {
+      requestHeaders.set(key, value);
+    }
+  }
+
+  let anthropicBetaOverride = null;
+
+  for (const [key, value] of Object.entries(headerConfig.overrides)) {
+    if (key.toLowerCase() === "anthropic-beta") {
+      anthropicBetaOverride = value;
+      continue;
+    }
+    requestHeaders.set(key, value);
+  }
+
+  for (const name of disabledHeaders) {
+    requestHeaders.delete(name);
+  }
+
+  const defaultBetas = getDefaultBetas(headerConfig.emulation_profile, modelName);
+  const configuredBetas = anthropicBetaOverride
+    ? anthropicBetaOverride
+        .split(",")
+        .map((b) => b.trim())
+        .filter(Boolean)
+    : defaultBetas;
+  const mergedBetas = [...new Set([...configuredBetas, ...incomingBetasList])].join(",");
 
   requestHeaders.set("authorization", `Bearer ${accessToken}`);
-  requestHeaders.set("anthropic-beta", mergedBetas);
-  requestHeaders.set("user-agent", "claude-cli/2.1.2 (external, cli)");
+  if (!disabledHeaders.has("anthropic-beta")) {
+    requestHeaders.set("anthropic-beta", mergedBetas);
+  }
   requestHeaders.delete("x-api-key");
 
   return requestHeaders;
+}
+
+/**
+ * Read request model from transformed JSON body.
+ * @param {string | undefined} body
+ * @returns {string | undefined}
+ */
+function extractModelName(body) {
+  if (!body || typeof body !== "string") return undefined;
+  try {
+    const parsed = JSON.parse(body);
+    if (parsed && typeof parsed === "object" && typeof parsed.model === "string" && parsed.model) {
+      return parsed.model;
+    }
+  } catch {
+    // ignore parse errors
+  }
+  return undefined;
 }
 
 /**
@@ -776,9 +829,10 @@ export async function AnthropicAuthPlugin({ client }) {
    * Complete a pending slash-command OAuth flow.
    * @param {string} sessionID
    * @param {string} code
+   * @param {"login" | "reauth"} expectedMode
    * @returns {Promise<{ ok: boolean, message: string }>}
    */
-  async function completeSlashOAuth(sessionID, code) {
+  async function completeSlashOAuth(sessionID, code, expectedMode) {
     const pending = pendingSlashOAuth.get(sessionID);
     if (!pending) {
       pruneExpiredPendingOAuth();
@@ -796,6 +850,13 @@ export async function AnthropicAuthPlugin({ client }) {
       };
     }
 
+    if (pending.mode !== expectedMode) {
+      return {
+        ok: false,
+        message: `Pending ${pending.mode} OAuth flow found. Complete with /anthropic ${pending.mode} complete <code#state> or restart.`,
+      };
+    }
+
     const credentials = await exchange(code, pending.verifier);
     if (credentials.type === "failed") {
       return { ok: false, message: "Token exchange failed. The code may be invalid or expired." };
@@ -807,13 +868,9 @@ export async function AnthropicAuthPlugin({ client }) {
       const existingIdx = stored.accounts.findIndex((acc) => acc.refreshToken === credentials.refresh);
       if (existingIdx >= 0) {
         const acc = stored.accounts[existingIdx];
-        acc.access = credentials.access;
-        acc.expires = credentials.expires;
-        if (credentials.email) acc.email = credentials.email;
+        applyOAuthCredentials(acc, credentials);
         acc.enabled = true;
-        acc.consecutiveFailures = 0;
-        acc.lastFailureTime = null;
-        acc.rateLimitResetTimes = {};
+        resetAccountTracking(acc);
         await saveAccounts(stored);
         await persistOpenCodeAuth(acc.refreshToken, acc.access, acc.expires);
         await reloadAccountManagerFromDisk();
@@ -858,14 +915,9 @@ export async function AnthropicAuthPlugin({ client }) {
     }
 
     const existing = stored.accounts[idx];
-    existing.refreshToken = credentials.refresh;
-    existing.access = credentials.access;
-    existing.expires = credentials.expires;
-    if (credentials.email) existing.email = credentials.email;
+    applyOAuthCredentials(existing, credentials);
     existing.enabled = true;
-    existing.consecutiveFailures = 0;
-    existing.lastFailureTime = null;
-    existing.rateLimitResetTimes = {};
+    resetAccountTracking(existing);
 
     await saveAccounts(stored);
     await persistOpenCodeAuth(existing.refreshToken, existing.access, existing.expires);
@@ -891,17 +943,9 @@ export async function AnthropicAuthPlugin({ client }) {
    */
   async function handleAnthropicSlashCommand(input) {
     const args = parseCommandArgs(input.arguments || "");
-    const primary = (args[0] || "list").toLowerCase();
-
-    // Friendly alias: /anthropic usage -> list
-    if (primary === "usage") {
-      const result = await runCliCommand(["list"]);
-      const heading = result.code === 0 ? "▣ Anthropic" : "▣ Anthropic (error)";
-      const body = result.stdout || result.stderr || "No output.";
-      await sendCommandMessage(input.sessionID, [heading, "", body].join("\n"));
-      await reloadAccountManagerFromDisk();
-      return;
-    }
+    const primaryToken = (args[0] || "list").toLowerCase();
+    const resolvedPrimary = resolveSlashCommandName(primaryToken);
+    const primary = resolvedPrimary || primaryToken;
 
     // Two-step login flow for slash commands
     if (primary === "login") {
@@ -914,7 +958,7 @@ export async function AnthropicAuthPlugin({ client }) {
           );
           return;
         }
-        const result = await completeSlashOAuth(input.sessionID, code);
+        const result = await completeSlashOAuth(input.sessionID, code, "login");
         const heading = result.ok ? "▣ Anthropic OAuth" : "▣ Anthropic OAuth (error)";
         await sendCommandMessage(input.sessionID, `${heading}\n\n${result.message}`);
         return;
@@ -935,7 +979,7 @@ export async function AnthropicAuthPlugin({ client }) {
           );
           return;
         }
-        const result = await completeSlashOAuth(input.sessionID, code);
+        const result = await completeSlashOAuth(input.sessionID, code, "reauth");
         const heading = result.ok ? "▣ Anthropic OAuth" : "▣ Anthropic OAuth (error)";
         await sendCommandMessage(input.sessionID, `${heading}\n\n${result.message}`);
         return;
@@ -968,7 +1012,7 @@ export async function AnthropicAuthPlugin({ client }) {
     }
 
     // Interactive CLI command is not compatible with slash flow.
-    if (primary === "manage" || primary === "mg") {
+    if (isInteractiveOnlyCommand(primary)) {
       await sendCommandMessage(
         input.sessionID,
         "▣ Anthropic\n\n`manage` is interactive-only. Use granular slash commands (switch/enable/disable/remove/reset) or run `opencode-anthropic-auth manage` in a terminal.",
@@ -979,12 +1023,12 @@ export async function AnthropicAuthPlugin({ client }) {
     // Route remaining commands through the CLI command surface.
     const cliArgs = [...args];
     if (cliArgs.length === 0) cliArgs.push("list");
+    if (resolvedPrimary) {
+      cliArgs[0] = primary;
+    }
 
     // Avoid readline prompts in slash mode.
-    if (
-      (primary === "remove" || primary === "rm" || primary === "logout" || primary === "lo") &&
-      !cliArgs.includes("--force")
-    ) {
+    if (isDestructiveCommand(primary) && !cliArgs.includes("--force")) {
       cliArgs.push("--force");
     }
 
@@ -1131,6 +1175,7 @@ export async function AnthropicAuthPlugin({ client }) {
               // Transform body and URL once (shared across retries)
               const requestInit = init ?? {};
               const body = transformRequestBody(requestInit.body);
+              const modelName = extractModelName(body);
               const { requestInput, requestUrl } = transformRequestUrl(input);
               const requestMethod = String(
                 requestInit.method || (requestInput instanceof Request ? requestInput.method : "POST"),
@@ -1224,7 +1269,7 @@ export async function AnthropicAuthPlugin({ client }) {
                 }
 
                 // Build headers with the selected account's token
-                const requestHeaders = buildRequestHeaders(input, requestInit, accessToken);
+                const requestHeaders = buildRequestHeaders(input, requestInit, accessToken, config.headers, modelName);
 
                 // Execute the request
                 let response;

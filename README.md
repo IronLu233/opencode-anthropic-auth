@@ -306,8 +306,50 @@ Configuration is stored at `~/.config/opencode/anthropic-auth.json`. All setting
     // Minimum seconds between account-switch toasts (0-300)
     "debounce_seconds": 30,
   },
+
+  // Outbound request header emulation (Claude Code spoof profile)
+  "headers": {
+    // Available: "claude-cli-2.1.50", "claude-cli-latest"
+    "emulation_profile": "claude-cli-2.1.50",
+
+    // Override any default spoofed header
+    "overrides": {
+      // "user-agent": "claude-cli/2.1.50 (external, cli)"
+      // "anthropic-beta": "custom-beta-a,custom-beta-b"
+    },
+
+    // Remove specific spoofed headers by name (case-insensitive)
+    "disable": [
+      // "x-stainless-timeout"
+    ],
+  },
 }
 ```
+
+Header override behavior:
+
+- Defaults come from the selected `emulation_profile`.
+- `overrides` replace default header values.
+- `overrides["anthropic-beta"]` replaces profile beta defaults, then incoming request betas are merged in and deduplicated.
+- `disable` removes headers after defaults/overrides are applied.
+
+### Default Emulation Profile
+
+The default profile (`claude-cli-2.1.50`, alias `claude-cli-latest`) sends pinned Claude Code-style headers, including:
+
+- `accept: application/json`
+- `anthropic-version: 2023-06-01`
+- `anthropic-dangerous-direct-browser-access: true`
+- `user-agent: claude-cli/2.1.50 (external, cli)`
+- `x-app: cli`
+- `x-stainless-*` metadata headers (pinned values)
+
+`anthropic-beta` defaults are model-aware:
+
+- Sonnet baseline: `claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05,effort-2025-11-24,adaptive-thinking-2026-01-28`
+- Opus adds: `context-management-2025-06-27`
+
+Transport-managed headers (such as `host`, `content-length`, `connection`, `accept-encoding`) are intentionally left to the HTTP runtime.
 
 ### Environment Variables
 

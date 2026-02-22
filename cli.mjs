@@ -32,6 +32,8 @@
 import { loadAccounts, saveAccounts, getStoragePath, createDefaultStats } from "./lib/storage.mjs";
 import { loadConfig, saveConfig, getConfigPath, VALID_STRATEGIES, CLIENT_ID } from "./lib/config.mjs";
 import { authorize, exchange, revoke } from "./lib/oauth.mjs";
+import { applyOAuthCredentials, resetAccountTracking, adjustActiveIndexAfterRemoval } from "./lib/account-state.mjs";
+import { resolveCliCommandName } from "./lib/commands.mjs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { pathToFileURL } from "node:url";
 import { exec } from "node:child_process";
@@ -371,9 +373,7 @@ export async function cmdLogin() {
   const existingIdx = storage.accounts.findIndex((acc) => acc.refreshToken === credentials.refresh);
   if (existingIdx >= 0) {
     // Update existing account
-    storage.accounts[existingIdx].access = credentials.access;
-    storage.accounts[existingIdx].expires = credentials.expires;
-    if (credentials.email) storage.accounts[existingIdx].email = credentials.email;
+    applyOAuthCredentials(storage.accounts[existingIdx], credentials);
     storage.accounts[existingIdx].enabled = true;
     await saveAccounts(storage);
 
@@ -414,6 +414,40 @@ export async function cmdLogin() {
 }
 
 /**
+ * Resolve and validate a CLI account target number.
+ * Handles parse, empty-storage, and bounds checks with command-specific messages.
+ * @param {string | undefined} arg
+ * @param {Awaited<ReturnType<typeof loadAccounts>>} stored
+ * @param {{
+ *   invalidArgMessage: string,
+ *   outOfRangeMessage: (n: number, accountCount: number) => string,
+ *   noAccountsMessage?: string,
+ * }} options
+ * @returns {{n: number, idx: number} | null}
+ */
+function resolveAccountTarget(arg, stored, options) {
+  const n = parseInt(arg, 10);
+  if (Number.isNaN(n) || n < 1) {
+    console.error(c.red(options.invalidArgMessage));
+    return null;
+  }
+
+  if (!stored || stored.accounts.length === 0) {
+    const message = options.noAccountsMessage || "Error: no accounts configured.";
+    console.error(c.red(message));
+    return null;
+  }
+
+  const idx = n - 1;
+  if (idx >= stored.accounts.length) {
+    console.error(c.red(options.outOfRangeMessage(n, stored.accounts.length)));
+    return null;
+  }
+
+  return { n, idx };
+}
+
+/**
  * Logout: revoke tokens and remove an account, or all accounts.
  * @param {string} arg - Account number
  * @param {object} [opts]
@@ -426,23 +460,16 @@ export async function cmdLogout(arg, opts = {}) {
     return cmdLogoutAll(opts);
   }
 
-  const n = parseInt(arg, 10);
-  if (isNaN(n) || n < 1) {
-    console.error(c.red("Error: provide a valid account number (e.g., 'logout 2') or --all."));
-    return 1;
-  }
-
   const stored = await loadAccounts();
-  if (!stored || stored.accounts.length === 0) {
-    console.error(c.red("Error: no accounts configured."));
+  const target = resolveAccountTarget(arg, stored, {
+    invalidArgMessage: "Error: provide a valid account number (e.g., 'logout 2') or --all.",
+    outOfRangeMessage: (n, accountCount) => `Error: account ${n} does not exist. You have ${accountCount} account(s).`,
+  });
+  if (!target) {
     return 1;
   }
 
-  const idx = n - 1;
-  if (idx >= stored.accounts.length) {
-    console.error(c.red(`Error: account ${n} does not exist. You have ${stored.accounts.length} account(s).`));
-    return 1;
-  }
+  const { n, idx } = target;
 
   const label = stored.accounts[idx].email || `Account ${n}`;
 
@@ -478,13 +505,7 @@ export async function cmdLogout(arg, opts = {}) {
   stored.accounts.splice(idx, 1);
 
   // Adjust active index
-  if (stored.accounts.length === 0) {
-    stored.activeIndex = 0;
-  } else if (stored.activeIndex >= stored.accounts.length) {
-    stored.activeIndex = stored.accounts.length - 1;
-  } else if (stored.activeIndex > idx) {
-    stored.activeIndex--;
-  }
+  adjustActiveIndexAfterRemoval(stored, idx);
 
   await saveAccounts(stored);
   console.log(c.green(`Logged out account #${n} (${label}).`));
@@ -554,28 +575,21 @@ async function cmdLogoutAll(opts = {}) {
  * @returns {Promise<number>} exit code
  */
 export async function cmdReauth(arg) {
-  const n = parseInt(arg, 10);
-  if (isNaN(n) || n < 1) {
-    console.error(c.red("Error: provide a valid account number (e.g., 'reauth 1')"));
-    return 1;
-  }
-
   if (!process.stdin.isTTY) {
     console.error(c.red("Error: 'reauth' requires an interactive terminal."));
     return 1;
   }
 
   const stored = await loadAccounts();
-  if (!stored || stored.accounts.length === 0) {
-    console.error(c.red("Error: no accounts configured."));
+  const target = resolveAccountTarget(arg, stored, {
+    invalidArgMessage: "Error: provide a valid account number (e.g., 'reauth 1')",
+    outOfRangeMessage: (n, accountCount) => `Error: account ${n} does not exist. You have ${accountCount} account(s).`,
+  });
+  if (!target) {
     return 1;
   }
 
-  const idx = n - 1;
-  if (idx >= stored.accounts.length) {
-    console.error(c.red(`Error: account ${n} does not exist. You have ${stored.accounts.length} account(s).`));
-    return 1;
-  }
+  const { n, idx } = target;
 
   const existing = stored.accounts[idx];
   const wasDisabled = !existing.enabled;
@@ -586,16 +600,11 @@ export async function cmdReauth(arg) {
   if (!credentials) return 1;
 
   // Update the account at the target index with fresh tokens
-  existing.refreshToken = credentials.refresh;
-  existing.access = credentials.access;
-  existing.expires = credentials.expires;
-  if (credentials.email) existing.email = credentials.email;
+  applyOAuthCredentials(existing, credentials);
 
   // Re-enable and reset failure tracking
   existing.enabled = true;
-  existing.consecutiveFailures = 0;
-  existing.lastFailureTime = null;
-  existing.rateLimitResetTimes = {};
+  resetAccountTracking(existing);
 
   await saveAccounts(stored);
 
@@ -614,23 +623,16 @@ export async function cmdReauth(arg) {
  * @returns {Promise<number>} exit code
  */
 export async function cmdRefresh(arg) {
-  const n = parseInt(arg, 10);
-  if (isNaN(n) || n < 1) {
-    console.error(c.red("Error: provide a valid account number (e.g., 'refresh 1')"));
-    return 1;
-  }
-
   const stored = await loadAccounts();
-  if (!stored || stored.accounts.length === 0) {
-    console.error(c.red("Error: no accounts configured."));
+  const target = resolveAccountTarget(arg, stored, {
+    invalidArgMessage: "Error: provide a valid account number (e.g., 'refresh 1')",
+    outOfRangeMessage: (n, accountCount) => `Error: account ${n} does not exist. You have ${accountCount} account(s).`,
+  });
+  if (!target) {
     return 1;
   }
 
-  const idx = n - 1;
-  if (idx >= stored.accounts.length) {
-    console.error(c.red(`Error: account ${n} does not exist. You have ${stored.accounts.length} account(s).`));
-    return 1;
-  }
+  const { n, idx } = target;
 
   const account = stored.accounts[idx];
   const label = account.email || `Account ${n}`;
@@ -648,9 +650,7 @@ export async function cmdRefresh(arg) {
   // Re-enable if disabled and reset failure tracking
   const wasDisabled = !account.enabled;
   account.enabled = true;
-  account.consecutiveFailures = 0;
-  account.lastFailureTime = null;
-  account.rateLimitResetTimes = {};
+  resetAccountTracking(account);
 
   await saveAccounts(stored);
 
@@ -677,7 +677,7 @@ export async function cmdList() {
   if (!stored || stored.accounts.length === 0) {
     console.log(c.yellow("No accounts configured."));
     console.log(c.dim(`Storage: ${shortPath(getStoragePath())}`));
-    console.log(c.dim("\nRun 'opencode auth login' and select 'Claude Pro/Max' to add accounts."));
+    console.log(c.dim("\nRun 'opencode-anthropic-auth login' and select 'Claude Pro/Max' to add accounts."));
     return 1;
   }
 
@@ -835,23 +835,16 @@ export async function cmdStatus() {
  * @returns {Promise<number>} exit code
  */
 export async function cmdSwitch(arg) {
-  const n = parseInt(arg, 10);
-  if (isNaN(n) || n < 1) {
-    console.error(c.red("Error: provide a valid account number (e.g., 'switch 2')"));
-    return 1;
-  }
-
   const stored = await loadAccounts();
-  if (!stored || stored.accounts.length === 0) {
-    console.error(c.red("Error: no accounts configured."));
+  const target = resolveAccountTarget(arg, stored, {
+    invalidArgMessage: "Error: provide a valid account number (e.g., 'switch 2')",
+    outOfRangeMessage: (n, accountCount) => `Error: account ${n} does not exist. You have ${accountCount} account(s).`,
+  });
+  if (!target) {
     return 1;
   }
 
-  const idx = n - 1;
-  if (idx >= stored.accounts.length) {
-    console.error(c.red(`Error: account ${n} does not exist. You have ${stored.accounts.length} account(s).`));
-    return 1;
-  }
+  const { n, idx } = target;
 
   if (!stored.accounts[idx].enabled) {
     console.error(c.yellow(`Warning: account ${n} is disabled. Enable it first with 'enable ${n}'.`));
@@ -872,23 +865,16 @@ export async function cmdSwitch(arg) {
  * @returns {Promise<number>} exit code
  */
 export async function cmdEnable(arg) {
-  const n = parseInt(arg, 10);
-  if (isNaN(n) || n < 1) {
-    console.error(c.red("Error: provide a valid account number (e.g., 'enable 3')"));
-    return 1;
-  }
-
   const stored = await loadAccounts();
-  if (!stored || stored.accounts.length === 0) {
-    console.error(c.red("Error: no accounts configured."));
+  const target = resolveAccountTarget(arg, stored, {
+    invalidArgMessage: "Error: provide a valid account number (e.g., 'enable 3')",
+    outOfRangeMessage: (n) => `Error: account ${n} does not exist.`,
+  });
+  if (!target) {
     return 1;
   }
 
-  const idx = n - 1;
-  if (idx >= stored.accounts.length) {
-    console.error(c.red(`Error: account ${n} does not exist.`));
-    return 1;
-  }
+  const { n, idx } = target;
 
   if (stored.accounts[idx].enabled) {
     console.log(c.dim(`Account ${n} is already enabled.`));
@@ -909,23 +895,16 @@ export async function cmdEnable(arg) {
  * @returns {Promise<number>} exit code
  */
 export async function cmdDisable(arg) {
-  const n = parseInt(arg, 10);
-  if (isNaN(n) || n < 1) {
-    console.error(c.red("Error: provide a valid account number (e.g., 'disable 3')"));
-    return 1;
-  }
-
   const stored = await loadAccounts();
-  if (!stored || stored.accounts.length === 0) {
-    console.error(c.red("Error: no accounts configured."));
+  const target = resolveAccountTarget(arg, stored, {
+    invalidArgMessage: "Error: provide a valid account number (e.g., 'disable 3')",
+    outOfRangeMessage: (n) => `Error: account ${n} does not exist.`,
+  });
+  if (!target) {
     return 1;
   }
 
-  const idx = n - 1;
-  if (idx >= stored.accounts.length) {
-    console.error(c.red(`Error: account ${n} does not exist.`));
-    return 1;
-  }
+  const { n, idx } = target;
 
   if (!stored.accounts[idx].enabled) {
     console.log(c.dim(`Account ${n} is already disabled.`));
@@ -973,23 +952,16 @@ export async function cmdDisable(arg) {
  * @returns {Promise<number>} exit code
  */
 export async function cmdRemove(arg, opts = {}) {
-  const n = parseInt(arg, 10);
-  if (isNaN(n) || n < 1) {
-    console.error(c.red("Error: provide a valid account number (e.g., 'remove 2')"));
-    return 1;
-  }
-
   const stored = await loadAccounts();
-  if (!stored || stored.accounts.length === 0) {
-    console.error(c.red("Error: no accounts configured."));
+  const target = resolveAccountTarget(arg, stored, {
+    invalidArgMessage: "Error: provide a valid account number (e.g., 'remove 2')",
+    outOfRangeMessage: (n) => `Error: account ${n} does not exist.`,
+  });
+  if (!target) {
     return 1;
   }
 
-  const idx = n - 1;
-  if (idx >= stored.accounts.length) {
-    console.error(c.red(`Error: account ${n} does not exist.`));
-    return 1;
-  }
+  const { n, idx } = target;
 
   const label = stored.accounts[idx].email || `Account ${n}`;
 
@@ -1014,13 +986,7 @@ export async function cmdRemove(arg, opts = {}) {
   stored.accounts.splice(idx, 1);
 
   // Adjust active index
-  if (stored.accounts.length === 0) {
-    stored.activeIndex = 0;
-  } else if (stored.activeIndex >= stored.accounts.length) {
-    stored.activeIndex = stored.accounts.length - 1;
-  } else if (stored.activeIndex > idx) {
-    stored.activeIndex--;
-  }
+  adjustActiveIndexAfterRemoval(stored, idx);
 
   await saveAccounts(stored);
   console.log(c.green(`Removed account #${n} (${label}).`));
@@ -1028,7 +994,7 @@ export async function cmdRemove(arg, opts = {}) {
   if (stored.accounts.length > 0) {
     console.log(c.dim(`${stored.accounts.length} account(s) remaining.`));
   } else {
-    console.log(c.dim("No accounts remaining. Run 'opencode auth login' to add one."));
+    console.log(c.dim("No accounts remaining. Run 'opencode-anthropic-auth login' to add one."));
   }
 
   return 0;
@@ -1054,9 +1020,7 @@ export async function cmdReset(arg) {
   if (arg.toLowerCase() === "all") {
     let count = 0;
     for (const acc of stored.accounts) {
-      acc.rateLimitResetTimes = {};
-      acc.consecutiveFailures = 0;
-      acc.lastFailureTime = null;
+      resetAccountTracking(acc);
       count++;
     }
     await saveAccounts(stored);
@@ -1064,21 +1028,17 @@ export async function cmdReset(arg) {
     return 0;
   }
 
-  const n = parseInt(arg, 10);
-  if (isNaN(n) || n < 1) {
-    console.error(c.red("Error: provide a valid account number or 'all'."));
+  const target = resolveAccountTarget(arg, stored, {
+    invalidArgMessage: "Error: provide a valid account number or 'all'.",
+    outOfRangeMessage: (n) => `Error: account ${n} does not exist.`,
+  });
+  if (!target) {
     return 1;
   }
 
-  const idx = n - 1;
-  if (idx >= stored.accounts.length) {
-    console.error(c.red(`Error: account ${n} does not exist.`));
-    return 1;
-  }
+  const { n, idx } = target;
 
-  stored.accounts[idx].rateLimitResetTimes = {};
-  stored.accounts[idx].consecutiveFailures = 0;
-  stored.accounts[idx].lastFailureTime = null;
+  resetAccountTracking(stored.accounts[idx]);
   await saveAccounts(stored);
 
   const label = stored.accounts[idx].email || `Account ${n}`;
@@ -1341,8 +1301,8 @@ export async function cmdResetStats(arg) {
   }
 
   const idx = parseInt(arg, 10) - 1;
-  if (isNaN(idx) || idx < 0 || idx >= stored.accounts.length) {
-    console.log(c.red(`Invalid account number. Use 1-${stored.accounts.length} or 'all'.`));
+  if (Number.isNaN(idx) || idx < 0 || idx >= stored.accounts.length) {
+    console.error(c.red(`Invalid account number. Use 1-${stored.accounts.length} or 'all'.`));
     return 1;
   }
 
@@ -1365,7 +1325,7 @@ export async function cmdManage() {
   let stored = await loadAccounts();
   if (!stored || stored.accounts.length === 0) {
     console.log(c.yellow("No accounts configured."));
-    console.log(c.dim("Run 'opencode auth login' and select 'Claude Pro/Max' to add accounts."));
+    console.log(c.dim("Run 'opencode-anthropic-auth login' and select 'Claude Pro/Max' to add accounts."));
     return 1;
   }
 
@@ -1420,7 +1380,7 @@ export async function cmdManage() {
       const num = numStr ? parseInt(numStr, 10) : NaN;
       const idx = num - 1;
 
-      if (numStr && (isNaN(num) || num < 1 || idx >= accounts.length)) {
+      if (numStr && (Number.isNaN(num) || num < 1 || idx >= accounts.length)) {
         console.log(c.red(`Invalid account number. Valid range: 1-${accounts.length}.`));
         continue;
       }
@@ -1429,13 +1389,11 @@ export async function cmdManage() {
       const isReset = rawCmd === "R" || cmd === "reset";
 
       if (isReset) {
-        if (isNaN(num)) {
+        if (Number.isNaN(num)) {
           console.log(c.red("Usage: R <number>"));
           continue;
         }
-        stored.accounts[idx].rateLimitResetTimes = {};
-        stored.accounts[idx].consecutiveFailures = 0;
-        stored.accounts[idx].lastFailureTime = null;
+        resetAccountTracking(stored.accounts[idx]);
         await saveAccounts(stored);
         console.log(c.green(`Reset tracking for account #${num}.`));
         continue;
@@ -1444,7 +1402,7 @@ export async function cmdManage() {
       switch (cmd) {
         case "s":
         case "switch": {
-          if (isNaN(num)) {
+          if (Number.isNaN(num)) {
             console.log(c.red("Usage: s <number>"));
             break;
           }
@@ -1460,7 +1418,7 @@ export async function cmdManage() {
         }
         case "e":
         case "enable": {
-          if (isNaN(num)) {
+          if (Number.isNaN(num)) {
             console.log(c.red("Usage: e <number>"));
             break;
           }
@@ -1475,7 +1433,7 @@ export async function cmdManage() {
         }
         case "d":
         case "disable": {
-          if (isNaN(num)) {
+          if (Number.isNaN(num)) {
             console.log(c.red("Usage: d <number>"));
             break;
           }
@@ -1500,7 +1458,7 @@ export async function cmdManage() {
         }
         case "r":
         case "remove": {
-          if (isNaN(num)) {
+          if (Number.isNaN(num)) {
             console.log(c.red("Usage: r <number>"));
             break;
           }
@@ -1509,13 +1467,7 @@ export async function cmdManage() {
           if (confirm.trim().toLowerCase() === "y") {
             stored.accounts.splice(idx, 1);
             // Adjust active index
-            if (stored.accounts.length === 0) {
-              stored.activeIndex = 0;
-            } else if (stored.activeIndex >= stored.accounts.length) {
-              stored.activeIndex = stored.accounts.length - 1;
-            } else if (stored.activeIndex > idx) {
-              stored.activeIndex--;
-            }
+            adjustActiveIndexAfterRemoval(stored, idx);
             await saveAccounts(stored);
             console.log(c.green(`Removed account #${num}.`));
           } else {
@@ -1673,44 +1625,41 @@ async function dispatch(argv) {
   if (flags.includes("--no-color")) USE_COLOR = false;
   if (flags.includes("--help")) return cmdHelp();
 
-  const command = args[0] || "list";
+  const commandToken = args[0] || "list";
+  const command = resolveCliCommandName(commandToken);
   const arg = args[1];
 
   const force = flags.includes("--force");
   const all = flags.includes("--all");
 
+  if (!command) {
+    console.error(c.red(`Unknown command: ${commandToken}`));
+    console.error(c.dim("Run 'opencode-anthropic-auth help' for usage."));
+    return 1;
+  }
+
   switch (command) {
     // Auth commands
     case "login":
-    case "ln":
       return cmdLogin();
     case "logout":
-    case "lo":
       return cmdLogout(arg, { force, all });
     case "reauth":
-    case "ra":
       return cmdReauth(arg);
     case "refresh":
-    case "rf":
       return cmdRefresh(arg);
     // Account management commands
     case "list":
-    case "ls":
       return cmdList();
     case "status":
-    case "st":
       return cmdStatus();
     case "switch":
-    case "sw":
       return cmdSwitch(arg);
     case "enable":
-    case "en":
       return cmdEnable(arg);
     case "disable":
-    case "dis":
       return cmdDisable(arg);
     case "remove":
-    case "rm":
       return cmdRemove(arg, { force });
     case "reset":
       return cmdReset(arg);
@@ -1719,23 +1668,18 @@ async function dispatch(argv) {
     case "reset-stats":
       return cmdResetStats(arg);
     case "strategy":
-    case "strat":
       return cmdStrategy(arg);
     case "config":
-    case "cfg":
       return cmdConfig();
     case "manage":
-    case "mg":
       return cmdManage();
     case "help":
-    case "-h":
-    case "--help":
       return cmdHelp();
-    default:
-      console.error(c.red(`Unknown command: ${command}`));
-      console.error(c.dim("Run 'opencode-anthropic-auth help' for usage."));
-      return 1;
   }
+
+  console.error(c.red(`Unknown command: ${commandToken}`));
+  console.error(c.dim("Run 'opencode-anthropic-auth help' for usage."));
+  return 1;
 }
 
 /**

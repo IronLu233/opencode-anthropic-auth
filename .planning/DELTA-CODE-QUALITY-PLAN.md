@@ -2,7 +2,7 @@
 
 Status: Proposed  
 Created: 2026-02-09  
-Last Updated: 2026-02-09  
+Last Updated: 2026-02-10  
 Branch: `rmk`  
 Baseline Commit: `14bc352be1d543d204558ddc2cde5a093f20b0cf`  
 Merge Base vs `master`: `d5a1ab46ac58c93d0edf5c9eea46f3e72981f1fd`
@@ -21,7 +21,7 @@ This plan is implementation-ready and designed so work can be resumed at any tim
 
 ### In Scope
 
-- Code changed in `master...HEAD` (currently 35 files)
+- Code changed in `master...HEAD` (currently 36 files)
 - Source + test normalization
 - Refactors that are behavior-preserving by default
 - Explicitly approved behavior changes only when fixing inconsistency bugs
@@ -165,9 +165,9 @@ Each phase is independently shippable.
 
 ### Tasks
 
-- [ ] Capture current test baseline and command-level behavior snapshots.
-- [ ] Record current duplication metrics (counts listed in section 4) for before/after comparison.
-- [ ] Add this plan file as the working source of truth.
+- [x] Capture current test baseline and command-level behavior snapshots.
+- [x] Record current duplication metrics (counts listed in section 4) for before/after comparison.
+- [x] Add this plan file as the working source of truth.
 
 ### Validation
 
@@ -188,9 +188,9 @@ Each phase is independently shippable.
 
 ### Candidate Changes
 
-- [ ] Normalize binary references from `opencode auth login` to `opencode-anthropic-auth login` in `cli.mjs:680`, `1031`, `1368`.
-- [ ] Standardize error channel usage (`console.error`) for invalid-input failure in `cmdResetStats` (`cli.mjs:1345`).
-- [ ] Normalize numeric validation style (prefer one pattern consistently in CLI).
+- [x] Normalize binary references from `opencode auth login` to `opencode-anthropic-auth login` in `cli.mjs:680`, `1031`, `1368`.
+- [x] Standardize error channel usage (`console.error`) for invalid-input failure in `cmdResetStats` (`cli.mjs:1345`).
+- [x] Normalize numeric validation style (prefer one pattern consistently in CLI).
 
 ### Files
 
@@ -215,13 +215,13 @@ Each phase is independently shippable.
 
 ### Proposed Extractions
 
-- [ ] `resetAccountTracking(account)`
+- [x] `resetAccountTracking(account)`
   - sets `rateLimitResetTimes = {}`
   - sets `consecutiveFailures = 0`
   - sets `lastFailureTime = null`
-- [ ] `adjustActiveIndexAfterRemoval(storage, removedIndex)`
+- [x] `adjustActiveIndexAfterRemoval(storage, removedIndex)`
   - centralize active index normalization behavior
-- [ ] optional: `applyOAuthCredentials(account, credentials, options)`
+- [x] optional: `applyOAuthCredentials(account, credentials, options)`
 
 ### Candidate Module
 
@@ -259,9 +259,9 @@ resolveAccountIndex(arg, stored, {
 
 ### Tasks
 
-- [ ] Introduce helper in `cli.mjs` (or `lib/` if reusable elsewhere).
-- [ ] Migrate one command at a time (recommended order: `switch`, `enable`, `disable`, `remove`, `logout`, `reauth`, `refresh`, `reset`).
-- [ ] Keep user-facing wording stable unless explicitly improving consistency.
+- [x] Introduce helper in `cli.mjs` (or `lib/` if reusable elsewhere).
+- [x] Migrate one command at a time (recommended order: `switch`, `enable`, `disable`, `remove`, `logout`, `reauth`, `refresh`, `reset`).
+- [x] Keep user-facing wording stable unless explicitly improving consistency.
 
 ### Validation
 
@@ -315,9 +315,9 @@ resolveAccountIndex(arg, stored, {
 
 ### Tasks
 
-- [ ] Introduce command metadata registry (command name, aliases, flags, interactive constraints).
-- [ ] Use registry for CLI dispatch and slash validation/routing as feasible.
-- [ ] Preserve slash-specific behavior (two-step OAuth, forced `--force` on destructive commands, interactive blocking for `manage`).
+- [x] Introduce command metadata registry (command name, aliases, flags, interactive constraints).
+- [x] Use registry for CLI dispatch and slash validation/routing as feasible.
+- [x] Preserve slash-specific behavior (two-step OAuth, forced `--force` on destructive commands, interactive blocking for `manage`).
 
 ### Validation
 
@@ -337,12 +337,12 @@ resolveAccountIndex(arg, stored, {
 
 ### Tasks
 
-- [ ] Create shared test helper module(s), e.g. `test/helpers/accounts-fixtures.mjs`.
-- [ ] Move reusable builders used by:
+- [x] Create shared test helper module(s), e.g. `test/helpers/accounts-fixtures.mjs`.
+- [x] Move reusable builders used by:
   - `index.test.mjs`
   - `lib/accounts.test.mjs`
   - optionally `lib/storage.test.mjs`
-- [ ] Keep tests explicit and readable; avoid over-abstracting assertions.
+- [x] Keep tests explicit and readable; avoid over-abstracting assertions.
 
 ### Validation
 
@@ -378,9 +378,9 @@ Each PR should include:
 
 For every phase:
 
-- [ ] `npm test`
-- [ ] `npm run lint`
-- [ ] `npm run format:check`
+- [x] `npm test`
+- [x] `npm run lint`
+- [x] `npm run format:check`
 
 Phase-specific:
 
@@ -441,15 +441,15 @@ Then:
 
 ## 13) Tracking Table
 
-| Phase | Name                            | Risk   | Status             | Notes |
-| ----- | ------------------------------- | ------ | ------------------ | ----- |
-| 0     | Baseline and guardrails         | Low    | Planned            |       |
-| 1     | Quick consistency wins          | Low    | Planned            |       |
-| 2     | Shared account mutation helpers | Medium | Planned            |       |
-| 3     | CLI account target resolver     | Medium | Planned            |       |
-| 4     | OAuth contract unification      | High   | Planned            |       |
-| 5     | Routing/alias normalization     | High   | Planned (optional) |       |
-| 6     | Test fixture consolidation      | Medium | Planned            |       |
+| Phase | Name                            | Risk   | Status                 | Notes                                                                      |
+| ----- | ------------------------------- | ------ | ---------------------- | -------------------------------------------------------------------------- |
+| 0     | Baseline and guardrails         | Low    | Completed (2026-02-10) | Baseline captured in `.planning/DELTA-CODE-QUALITY-BASELINE.md`            |
+| 1     | Quick consistency wins          | Low    | Completed (2026-02-10) | CLI references + error channel + numeric validation normalized             |
+| 2     | Shared account mutation helpers | Medium | Completed (2026-02-10) | Shared reset/index/credential helpers extracted to `lib/account-state.mjs` |
+| 3     | CLI account target resolver     | Medium | Completed (2026-02-10) | Shared account target resolver added in `cli.mjs`                          |
+| 4     | OAuth contract unification      | High   | Deferred (excluded)    | Skipped per request: "except the oauth high risk items"                    |
+| 5     | Routing/alias normalization     | High   | Completed (2026-02-10) | Shared command registry powers CLI + slash alias resolution                |
+| 6     | Test fixture consolidation      | Medium | Completed (2026-02-10) | Shared fixture helpers moved to `test/helpers/accounts-fixtures.mjs`       |
 
 ---
 

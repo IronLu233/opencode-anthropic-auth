@@ -1765,6 +1765,7 @@ describe("cmdResetStats", () => {
 
     const code = await cmdResetStats("99");
     expect(code).toBe(1);
+    expect(output.errorText()).toContain("Invalid account number");
   });
 
   it("resets all accounts when no argument given", async () => {

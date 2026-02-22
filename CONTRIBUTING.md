@@ -49,6 +49,12 @@ opencode-anthropic-auth/
   .prettierignore        Prettier ignore patterns
   .husky/                Git hooks (pre-commit: lint-staged, pre-push: test + format check)
   lib/
+    account-state.mjs    Shared account mutation helpers (tracking reset, active-index adjustment, OAuth credential apply)
+    account-state.test.mjs
+    commands.mjs         Shared command registry + alias resolution (CLI + slash)
+    commands.test.mjs
+    request-headers.mjs  Claude Code header emulation profiles + model-aware beta defaults
+    request-headers.test.mjs
     oauth.mjs            Shared OAuth helpers (authorize, exchange, revoke) — used by both plugin and CLI
     accounts.mjs         AccountManager class (pool management, selection, persistence)
     accounts.test.mjs    AccountManager tests
@@ -66,6 +72,8 @@ opencode-anthropic-auth/
   dist/                  Build output (gitignored)
     opencode-anthropic-auth-plugin.js   Bundled plugin (self-contained)
     opencode-anthropic-auth-cli.mjs     Bundled CLI (self-contained)
+  test/helpers/
+    accounts-fixtures.mjs  Shared test account fixture builders
 ```
 
 ## Architecture Overview
@@ -188,7 +196,7 @@ flowchart LR
     subgraph Output
         OB["Sanitized body<br/>(OpenCode→Claude Code,<br/>tool name prefixing)"]
         OU["Modified URL<br/>(?beta=true)"]
-        OH["OAuth headers<br/>(Bearer token,<br/>anthropic-beta,<br/>user-agent)"]
+        OH["Spoofed Claude CLI headers<br/>(Bearer token,<br/>anthropic-beta,<br/>user-agent,<br/>x-stainless-*)"]
     end
 
     Body --> TB --> OB
@@ -216,12 +224,13 @@ flowchart LR
 
 ### Header Transformations
 
-| Step             | What                                               | Why                            |
-| ---------------- | -------------------------------------------------- | ------------------------------ |
-| Authorization    | `Bearer <access_token>`                            | OAuth authentication           |
-| Beta headers     | `oauth-2025-04-20,interleaved-thinking-2025-05-14` | Required beta features         |
-| User agent       | `claude-cli/2.1.2 (external, cli)`                 | Identifies as Claude CLI       |
-| Remove x-api-key | Delete if present                                  | OAuth uses Bearer, not API key |
+| Step             | What                                                                                                  | Why                                    |
+| ---------------- | ----------------------------------------------------------------------------------------------------- | -------------------------------------- |
+| Authorization    | `Bearer <access_token>`                                                                               | OAuth authentication                   |
+| Header profile   | Pinned Claude CLI profile (`claude-cli-2.1.50`) including `x-app` + `x-stainless-*`                   | Spoof separate Claude CLI client       |
+| Beta headers     | Profile defaults (+ Opus-specific `context-management-2025-06-27`), merged with incoming custom betas | Required beta features + compatibility |
+| User overrides   | `headers.overrides` (including `anthropic-beta`) then `headers.disable` removal                       | Per-install customization              |
+| Remove x-api-key | Delete if present                                                                                     | OAuth uses Bearer, not API key         |
 
 ### Response Transformations
 
