@@ -2,13 +2,14 @@ import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { AccountManager } from "./lib/accounts.mjs";
 import { main as cliMain } from "./cli.mjs";
-import { authorize, exchange } from "./lib/oauth.mjs";
-import { loadConfig, CLIENT_ID } from "./lib/config.mjs";
+import { authorize, exchange, refreshToken } from "./lib/oauth.mjs";
+import { loadConfig } from "./lib/config.mjs";
 import { loadAccounts, saveAccounts, clearAccounts, createDefaultStats } from "./lib/storage.mjs";
 import { applyOAuthCredentials, resetAccountTracking } from "./lib/account-state.mjs";
 import { resolveSlashCommandName, isDestructiveCommand, isInteractiveOnlyCommand } from "./lib/commands.mjs";
 import { isAccountSpecificError, parseRateLimitReason, parseRetryAfterHeader } from "./lib/backoff.mjs";
 import { getHeaderProfile, getDefaultBetas } from "./lib/request-headers.mjs";
+import { stripAnsi } from "./lib/util.mjs";
 
 // ---------------------------------------------------------------------------
 // Account management CLI prompts
@@ -385,6 +386,74 @@ function getMidStreamAccountError(parsed) {
 }
 
 /**
+ * Strip `mcp_` prefix from tool_use `name` fields in SSE data lines.
+ * Only modifies `name` values inside content blocks with `"type": "tool_use"`.
+ * Non-JSON lines and text blocks are left untouched.
+ *
+ * @param {string} text - Raw SSE chunk text (may contain multiple lines)
+ * @returns {string}
+ */
+function stripMcpPrefixFromSSE(text) {
+  return text.replace(/^data: (.+)$/gm, (_match, jsonStr) => {
+    try {
+      const parsed = JSON.parse(jsonStr);
+      if (stripMcpPrefixFromParsedEvent(parsed)) {
+        return `data: ${JSON.stringify(parsed)}`;
+      }
+    } catch {
+      // Not valid JSON — pass through unchanged.
+    }
+    return _match;
+  });
+}
+
+/**
+ * Mutate a parsed SSE event object, removing `mcp_` prefix from tool_use
+ * name fields. Returns true if any modification was made.
+ *
+ * @param {any} parsed
+ * @returns {boolean}
+ */
+function stripMcpPrefixFromParsedEvent(parsed) {
+  if (!parsed || typeof parsed !== "object") return false;
+
+  let modified = false;
+
+  // content_block_start: { content_block: { type: "tool_use", name: "mcp_..." } }
+  if (
+    parsed.content_block &&
+    parsed.content_block.type === "tool_use" &&
+    typeof parsed.content_block.name === "string" &&
+    parsed.content_block.name.startsWith("mcp_")
+  ) {
+    parsed.content_block.name = parsed.content_block.name.slice(4);
+    modified = true;
+  }
+
+  // message_start: { message: { content: [{ type: "tool_use", name: "mcp_..." }] } }
+  if (parsed.message && Array.isArray(parsed.message.content)) {
+    for (const block of parsed.message.content) {
+      if (block.type === "tool_use" && typeof block.name === "string" && block.name.startsWith("mcp_")) {
+        block.name = block.name.slice(4);
+        modified = true;
+      }
+    }
+  }
+
+  // Top-level content array (non-streaming responses forwarded through SSE)
+  if (Array.isArray(parsed.content)) {
+    for (const block of parsed.content) {
+      if (block.type === "tool_use" && typeof block.name === "string" && block.name.startsWith("mcp_")) {
+        block.name = block.name.slice(4);
+        modified = true;
+      }
+    }
+  }
+
+  return modified;
+}
+
+/**
  * Wrap a response body stream to strip mcp_ prefix from tool names,
  * extract token usage stats from SSE events, and detect mid-stream
  * account-specific errors (so the account can be marked for the NEXT request).
@@ -479,7 +548,7 @@ function transformResponse(response, onUsage, onAccountError) {
         processSSEBuffer(false);
       }
 
-      text = text.replace(/"name"\s*:\s*"mcp_([^"]+)"/g, '"name": "$1"');
+      text = stripMcpPrefixFromSSE(text);
       controller.enqueue(encoder.encode(text));
     },
   });
@@ -590,48 +659,13 @@ function buildNoAvailableAccountReason(accountManager, transientRefreshSkips, la
 /**
  * Refresh an account's access token.
  * @param {import('./lib/accounts.mjs').ManagedAccount} account
- * @param {ReturnType<typeof import('@opencode-ai/sdk').createOpencodeClient>} client
+ * @param {ReturnType<typeof import('@opencode-ai/plugin').createOpencodeClient>} client
  * @returns {Promise<string>} The new access token
  * @throws {Error} If refresh fails
  */
 async function refreshAccountToken(account, client) {
-  const response = await fetch("https://console.anthropic.com/v1/oauth/token", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      grant_type: "refresh_token",
-      refresh_token: account.refreshToken,
-      client_id: CLIENT_ID,
-    }),
-  });
+  const json = await refreshToken(account.refreshToken, { signal: AbortSignal.timeout(10_000) });
 
-  if (!response.ok) {
-    const bodyText = await response.text().catch(() => "");
-    let errorCode = "";
-    if (bodyText) {
-      try {
-        const parsed = JSON.parse(bodyText);
-        if (parsed && typeof parsed.error === "string") {
-          errorCode = parsed.error;
-        }
-      } catch {
-        // body may be non-JSON
-      }
-    }
-
-    const err = new Error(`Token refresh failed: ${response.status}${errorCode ? ` (${errorCode})` : ""}`);
-    // @ts-ignore JS runtime property bag
-    err.status = response.status;
-    // @ts-ignore JS runtime property bag
-    err.errorCode = errorCode;
-    // @ts-ignore JS runtime property bag
-    err.body = bodyText;
-    throw err;
-  }
-
-  const json = await response.json();
   account.access = json.access_token;
   account.expires = Date.now() + json.expires_in * 1000;
   if (json.refresh_token) {
@@ -658,15 +692,6 @@ async function refreshAccountToken(account, client) {
 
 const ANTHROPIC_COMMAND_HANDLED = "__ANTHROPIC_COMMAND_HANDLED__";
 const PENDING_OAUTH_TTL_MS = 10 * 60 * 1000;
-
-/**
- * Remove ANSI color/control codes from output text.
- * @param {string} value
- * @returns {string}
- */
-function stripAnsi(value) {
-  return value.replace(/\x1b\[[0-9;]*m/g, ""); // eslint-disable-line no-control-regex
-}
 
 /**
  * Parse command arguments with minimal quote support.
@@ -806,7 +831,7 @@ export async function AnthropicAuthPlugin({ client }) {
       createdAt: Date.now(),
     });
 
-    const action = mode === "login" ? "login" : `reauth ${targetIndex + 1}`;
+    const action = mode === "login" ? "login" : `reauth ${(targetIndex ?? 0) + 1}`;
     const followup =
       mode === "login" ? "/anthropic login complete <code#state>" : "/anthropic reauth complete <code#state>";
 
@@ -1180,12 +1205,7 @@ export async function AnthropicAuthPlugin({ client }) {
               const requestMethod = String(
                 requestInit.method || (requestInput instanceof Request ? requestInput.method : "POST"),
               ).toUpperCase();
-              let showUsageToast;
-              try {
-                showUsageToast = new URL(requestUrl).pathname === "/v1/messages" && requestMethod === "POST";
-              } catch {
-                showUsageToast = false;
-              }
+              const showUsageToast = requestUrl?.pathname === "/v1/messages" && requestMethod === "POST";
 
               let lastError = null;
               const transientRefreshSkips = new Set();
@@ -1243,7 +1263,9 @@ export async function AnthropicAuthPlugin({ client }) {
                     const msg = err instanceof Error ? err.message : String(err);
                     const status = typeof err === "object" && err && "status" in err ? Number(err.status) : NaN;
                     const errorCode =
-                      typeof err === "object" && err && "errorCode" in err ? String(err.errorCode || "") : "";
+                      typeof err === "object" && err && ("errorCode" in err || "code" in err)
+                        ? String(err.errorCode || err.code || "")
+                        : "";
                     const shouldDisable =
                       status === 400 ||
                       status === 401 ||
@@ -1475,13 +1497,26 @@ export async function AnthropicAuthPlugin({ client }) {
               callback: async (code) => {
                 const credentials = await exchange(code, verifier);
                 if (credentials.type === "failed") return credentials;
-                const result = await fetch(`https://api.anthropic.com/api/oauth/claude_cli/create_api_key`, {
-                  method: "POST",
-                  headers: {
-                    "Content-Type": "application/json",
-                    authorization: `Bearer ${credentials.access}`,
-                  },
-                }).then((r) => r.json());
+                let result;
+                try {
+                  const resp = await fetch(`https://api.anthropic.com/api/oauth/claude_cli/create_api_key`, {
+                    method: "POST",
+                    headers: {
+                      "Content-Type": "application/json",
+                      authorization: `Bearer ${credentials.access}`,
+                    },
+                  });
+                  if (!resp.ok) {
+                    const text = await resp.text().catch(() => "");
+                    return { type: "failed", error: `API key creation failed (HTTP ${resp.status}): ${text}` };
+                  }
+                  result = await resp.json();
+                } catch (err) {
+                  return { type: "failed", error: `API key creation failed: ${err.message}` };
+                }
+                if (!result?.raw_key) {
+                  return { type: "failed", error: "API key creation failed: no key in response" };
+                }
                 return { type: "success", key: result.raw_key };
               },
             };

@@ -656,8 +656,105 @@ describe("fetch interceptor", () => {
     });
 
     const text = await response.text();
-    expect(text).toContain('"name": "read_file"');
+    expect(text).toContain('"name":"read_file"');
     expect(text).not.toContain("mcp_read_file");
+  });
+
+  it("double-prefixes tools already named mcp_* in request body", async () => {
+    mockFetch.mockResolvedValueOnce(new Response("", { status: 200 }));
+
+    await fetchFn("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        tools: [{ name: "mcp_server", description: "An MCP server tool" }],
+        messages: [
+          {
+            role: "assistant",
+            content: [{ type: "tool_use", name: "mcp_server", id: "t1", input: {} }],
+          },
+        ],
+      }),
+    });
+
+    const [, init] = mockFetch.mock.calls[0];
+    const body = JSON.parse(init.body);
+    // Must become mcp_mcp_server so that response stripping restores the original name
+    expect(body.tools[0].name).toBe("mcp_mcp_server");
+    expect(body.messages[0].content[0].name).toBe("mcp_mcp_server");
+  });
+
+  it("round-trips mcp_-prefixed tool names correctly", async () => {
+    // Tool already named mcp_server → sent as mcp_mcp_server → response strips back to mcp_server
+    const responseBody =
+      'data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"mcp_mcp_server","id":"t1"}}\n\n';
+    mockFetch.mockResolvedValueOnce(
+      new Response(responseBody, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    );
+
+    const response = await fetchFn("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        tools: [{ name: "mcp_server", description: "An MCP server tool" }],
+        messages: [],
+      }),
+    });
+
+    const text = await response.text();
+    // Should strip one mcp_ prefix, restoring original name
+    expect(text).toContain('"name":"mcp_server"');
+    expect(text).not.toContain("mcp_mcp_server");
+  });
+
+  it("does not strip mcp_ from text content in response stream", async () => {
+    // A text content block that happens to contain "name": "mcp_foo" — should NOT be modified
+    const responseBody =
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"The tool \\"name\\": \\"mcp_foo\\" was called."}}\n\n';
+    mockFetch.mockResolvedValueOnce(
+      new Response(responseBody, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    );
+
+    const response = await fetchFn("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({ messages: [] }),
+    });
+
+    const text = await response.text();
+    // The mcp_foo in text content should be preserved
+    expect(text).toContain("mcp_foo");
+  });
+
+  it("strips mcp_ from tool_use blocks but not text blocks in response stream", async () => {
+    // Two SSE events: one tool_use (should strip), one text (should preserve)
+    const sseBody = [
+      'data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"mcp_write_file","id":"t1"}}',
+      "",
+      'data: {"type":"content_block_start","content_block":{"type":"text","text":"Using tool \\"name\\": \\"mcp_write_file\\""}}',
+      "",
+    ].join("\n");
+
+    mockFetch.mockResolvedValueOnce(
+      new Response(sseBody, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    );
+
+    const response = await fetchFn("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({ messages: [] }),
+    });
+
+    const text = await response.text();
+    // tool_use name should have mcp_ stripped
+    expect(text).toContain('"name":"write_file"');
+    // text content should still have mcp_write_file
+    expect(text).toContain("mcp_write_file");
   });
 
   it("does not show account usage toast for non-message endpoints", async () => {
@@ -804,7 +901,8 @@ describe("fetch interceptor — token refresh", () => {
     // First call should be the token refresh
     const [refreshUrl, refreshInit] = mockFetch.mock.calls[0];
     expect(refreshUrl).toBe("https://console.anthropic.com/v1/oauth/token");
-    expect(JSON.parse(refreshInit.body).grant_type).toBe("refresh_token");
+    const refreshBody = new URLSearchParams(refreshInit.body);
+    expect(refreshBody.get("grant_type")).toBe("refresh_token");
 
     // Second call should use the fresh token
     const [, apiInit] = mockFetch.mock.calls[1];
@@ -889,7 +987,7 @@ describe("fetch interceptor — token refresh", () => {
     mockFetch.mockResolvedValueOnce({
       ok: false,
       status: 401,
-      json: async () => ({ error: "invalid_grant" }),
+      text: async () => JSON.stringify({ error: "invalid_grant" }),
     });
     // Account 2 token refresh (also no access token)
     mockFetch.mockResolvedValueOnce(mockTokenRefresh("good-access", "good-refresh"));
@@ -2134,5 +2232,128 @@ describe("markSuccess wiring", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// API key creation handler error handling
+// ---------------------------------------------------------------------------
+
+describe("API key creation handler", () => {
+  let client;
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    client = makeClient();
+    loadAccounts.mockResolvedValue(null);
+    saveAccounts.mockResolvedValue(undefined);
+  });
+
+  async function getApiKeyCallback() {
+    const plugin = await AnthropicAuthPlugin({ client });
+    const apiKeyHandler = plugin.auth.methods.find((m) => m.label === "Create an API Key");
+    const { callback } = await apiKeyHandler.authorize();
+    return callback;
+  }
+
+  it("returns success with key when API responds 200", async () => {
+    // First mock: OAuth exchange (for authorize → exchange call)
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        access_token: "at",
+        refresh_token: "rt",
+        expires_in: 3600,
+      }),
+    });
+    const callback = await getApiKeyCallback();
+
+    // Second mock: API key creation success
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ raw_key: "sk-ant-test-key" }),
+    });
+    const result = await callback("test-code");
+    expect(result).toEqual({ type: "success", key: "sk-ant-test-key" });
+  });
+
+  it("returns failed when API responds with HTTP error", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        access_token: "at",
+        refresh_token: "rt",
+        expires_in: 3600,
+      }),
+    });
+    const callback = await getApiKeyCallback();
+
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 500,
+      text: async () => "Internal Server Error",
+    });
+    const result = await callback("test-code");
+    expect(result.type).toBe("failed");
+    expect(result.error).toContain("HTTP 500");
+  });
+
+  it("returns failed when fetch throws (network error)", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        access_token: "at",
+        refresh_token: "rt",
+        expires_in: 3600,
+      }),
+    });
+    const callback = await getApiKeyCallback();
+
+    mockFetch.mockRejectedValueOnce(new Error("Network failure"));
+    const result = await callback("test-code");
+    expect(result.type).toBe("failed");
+    expect(result.error).toContain("Network failure");
+  });
+
+  it("returns failed when response JSON is unparseable", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        access_token: "at",
+        refresh_token: "rt",
+        expires_in: 3600,
+      }),
+    });
+    const callback = await getApiKeyCallback();
+
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => {
+        throw new SyntaxError("Unexpected token");
+      },
+    });
+    const result = await callback("test-code");
+    expect(result.type).toBe("failed");
+    expect(result.error).toContain("Unexpected token");
+  });
+
+  it("returns failed when response has no raw_key", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        access_token: "at",
+        refresh_token: "rt",
+        expires_in: 3600,
+      }),
+    });
+    const callback = await getApiKeyCallback();
+
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ some_other_field: "value" }),
+    });
+    const result = await callback("test-code");
+    expect(result.type).toBe("failed");
+    expect(result.error).toContain("no key in response");
   });
 });

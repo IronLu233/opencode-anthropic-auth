@@ -31,20 +31,24 @@ vi.mock("./lib/config.mjs", async (importOriginal) => {
   };
 });
 
-vi.mock("./lib/oauth.mjs", () => ({
-  authorize: vi.fn(async () => ({ url: "https://auth.example/authorize", verifier: "pkce-verifier" })),
-  exchange: vi.fn(async () => ({
-    type: "success",
-    refresh: "refresh-new",
-    access: "access-new",
-    expires: Date.now() + 3600_000,
-    email: "new@example.com",
-  })),
-  revoke: vi.fn(async () => true),
-}));
+vi.mock("./lib/oauth.mjs", async (importOriginal) => {
+  const original = await importOriginal();
+  return {
+    authorize: vi.fn(async () => ({ url: "https://auth.example/authorize", verifier: "pkce-verifier" })),
+    exchange: vi.fn(async () => ({
+      type: "success",
+      refresh: "refresh-new",
+      access: "access-new",
+      expires: Date.now() + 3600_000,
+      email: "new@example.com",
+    })),
+    revoke: vi.fn(async () => true),
+    refreshToken: original.refreshToken,
+  };
+});
 
 vi.mock("node:child_process", () => ({
-  exec: vi.fn(),
+  execFile: vi.fn(() => ({ on: vi.fn() })),
 }));
 
 // Mock readline for interactive commands
@@ -84,7 +88,7 @@ import {
 import { loadAccounts, saveAccounts } from "./lib/storage.mjs";
 import { authorize, exchange, revoke } from "./lib/oauth.mjs";
 import { createInterface } from "node:readline/promises";
-import { exec } from "node:child_process";
+import { execFile } from "node:child_process";
 
 // ---------------------------------------------------------------------------
 // Global fetch mock — prevents real HTTP calls and speeds up tests
@@ -95,7 +99,7 @@ vi.stubGlobal("fetch", mockFetch);
 beforeEach(() => {
   mockFetch.mockReset();
   // Default: all fetches fail gracefully (usage endpoints return null)
-  mockFetch.mockResolvedValue({ ok: false, status: 500 });
+  mockFetch.mockResolvedValue({ ok: false, status: 500, text: async () => "" });
 });
 
 // ---------------------------------------------------------------------------
@@ -345,7 +349,7 @@ describe("refreshAccessToken", () => {
 
   it("returns null on failure", async () => {
     const account = { refreshToken: "bad-refresh" };
-    mockFetch.mockResolvedValueOnce({ ok: false, status: 401 });
+    mockFetch.mockResolvedValueOnce({ ok: false, status: 401, text: async () => "Unauthorized" });
 
     const token = await refreshAccessToken(account);
     expect(token).toBeNull();
@@ -439,7 +443,7 @@ describe("ensureTokenAndFetchUsage", () => {
       access: undefined,
       expires: undefined,
     };
-    mockFetch.mockResolvedValueOnce({ ok: false, status: 401 });
+    mockFetch.mockResolvedValueOnce({ ok: false, status: 401, text: async () => "Unauthorized" });
 
     const result = await ensureTokenAndFetchUsage(account);
     expect(result.usage).toBeNull();
@@ -461,11 +465,11 @@ function mockUsageForAccounts(...usages) {
     const target = String(url);
 
     if (target.includes("/v1/oauth/token")) {
-      if (queue.length === 0) return Promise.resolve({ ok: false, status: 500 });
+      if (queue.length === 0) return Promise.resolve({ ok: false, status: 500, text: async () => "" });
 
       const usage = queue.shift();
       if (usage === null) {
-        return Promise.resolve({ ok: false, status: 401 });
+        return Promise.resolve({ ok: false, status: 401, text: async () => "Unauthorized" });
       }
 
       tokenCounter += 1;
@@ -913,7 +917,7 @@ describe("auth commands", () => {
       expect(code).toBe(0);
       expect(authorize).toHaveBeenCalledWith("max");
       expect(exchange).toHaveBeenCalledWith("auth-code#state", "pkce-verifier");
-      expect(exec).toHaveBeenCalled();
+      expect(execFile).toHaveBeenCalled();
       expect(saveAccounts).toHaveBeenCalledWith(
         expect.objectContaining({
           version: 1,
@@ -993,6 +997,54 @@ describe("auth commands", () => {
       expect(saveAccounts).not.toHaveBeenCalled();
     } finally {
       restoreTTY();
+    }
+  });
+
+  it("cmdLogin opens browser with execFile on macOS", async () => {
+    const originalPlatform = process.platform;
+    Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
+    loadAccounts.mockResolvedValue(null);
+    const restoreTTY = setStdinTTY(true);
+    mockReadlineAnswer("auth-code#state");
+
+    try {
+      await cmdLogin();
+      expect(execFile).toHaveBeenCalledWith("open", [expect.stringContaining("https://")]);
+    } finally {
+      restoreTTY();
+      Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+    }
+  });
+
+  it("cmdLogin opens browser with execFile on Linux", async () => {
+    const originalPlatform = process.platform;
+    Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+    loadAccounts.mockResolvedValue(null);
+    const restoreTTY = setStdinTTY(true);
+    mockReadlineAnswer("auth-code#state");
+
+    try {
+      await cmdLogin();
+      expect(execFile).toHaveBeenCalledWith("xdg-open", [expect.stringContaining("https://")]);
+    } finally {
+      restoreTTY();
+      Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+    }
+  });
+
+  it("cmdLogin opens browser with execFile on Windows", async () => {
+    const originalPlatform = process.platform;
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    loadAccounts.mockResolvedValue(null);
+    const restoreTTY = setStdinTTY(true);
+    mockReadlineAnswer("auth-code#state");
+
+    try {
+      await cmdLogin();
+      expect(execFile).toHaveBeenCalledWith("cmd", ["/c", "start", "", expect.stringContaining("https://")]);
+    } finally {
+      restoreTTY();
+      Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
     }
   });
 
@@ -1086,7 +1138,7 @@ describe("auth commands", () => {
 
   it("cmdRefresh suggests reauth when refresh fails", async () => {
     loadAccounts.mockResolvedValue(makeStorage());
-    mockFetch.mockResolvedValueOnce({ ok: false, status: 401 });
+    mockFetch.mockResolvedValueOnce({ ok: false, status: 401, text: async () => "Unauthorized" });
 
     const code = await cmdRefresh("1");
     expect(code).toBe(1);
@@ -1794,5 +1846,109 @@ describe("cmdResetStats", () => {
     loadAccounts.mockResolvedValue(null);
     const code = await cmdResetStats("all");
     expect(code).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Additional main() routing tests
+// ---------------------------------------------------------------------------
+
+describe("main routing (additional commands)", () => {
+  let output;
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    output = captureOutput();
+    loadAccounts.mockResolvedValue(makeStorage());
+    saveAccounts.mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    output.restore();
+  });
+
+  it("routes 'stats' to cmdStats", async () => {
+    const code = await main(["stats"]);
+    expect(code).toBe(0);
+    expect(output.text()).toContain("Anthropic Account Usage");
+  });
+
+  it("routes 'reset-stats' to cmdResetStats", async () => {
+    const code = await main(["reset-stats"]);
+    expect(code).toBe(0);
+    expect(output.text()).toContain("Reset usage statistics for all");
+  });
+
+  it("routes 'strategy' to cmdStrategy (show mode)", async () => {
+    const code = await main(["strategy"]);
+    expect(code).toBe(0);
+    expect(output.text()).toContain("Account Selection Strategy");
+  });
+
+  it("routes 'strat' alias to cmdStrategy", async () => {
+    const code = await main(["strat"]);
+    expect(code).toBe(0);
+    expect(output.text()).toContain("Account Selection Strategy");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cmdRefresh with "all" argument
+// ---------------------------------------------------------------------------
+
+describe("cmdRefresh edge cases", () => {
+  let output;
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    output = captureOutput();
+    loadAccounts.mockResolvedValue(makeStorage());
+    saveAccounts.mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    output.restore();
+  });
+
+  it("rejects 'all' as an invalid account number", async () => {
+    // cmdRefresh only accepts a numeric account number, not "all"
+    const code = await cmdRefresh("all");
+    expect(code).toBe(1);
+    expect(output.errorText()).toContain("valid account number");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cmdLogin when exchange returns { type: "failed" }
+// ---------------------------------------------------------------------------
+
+describe("cmdLogin failed exchange", () => {
+  let output;
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    output = captureOutput();
+    saveAccounts.mockResolvedValue(undefined);
+    loadAccounts.mockResolvedValue(null);
+    vi.mocked(authorize).mockResolvedValue({ url: "https://auth.example/authorize", verifier: "pkce-verifier" });
+  });
+
+  afterEach(() => {
+    output.restore();
+  });
+
+  it("handles failed exchange gracefully", async () => {
+    vi.mocked(exchange).mockResolvedValue({ type: "failed" });
+    const restoreTTY = setStdinTTY(true);
+    mockReadlineAnswer("auth-code#state");
+
+    try {
+      const code = await cmdLogin();
+      expect(code).toBe(1);
+      expect(output.errorText()).toContain("token exchange failed");
+      expect(saveAccounts).not.toHaveBeenCalled();
+    } finally {
+      restoreTTY();
+    }
   });
 });

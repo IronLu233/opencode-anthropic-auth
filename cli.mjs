@@ -30,13 +30,14 @@
  */
 
 import { loadAccounts, saveAccounts, getStoragePath, createDefaultStats } from "./lib/storage.mjs";
-import { loadConfig, saveConfig, getConfigPath, VALID_STRATEGIES, CLIENT_ID } from "./lib/config.mjs";
-import { authorize, exchange, revoke } from "./lib/oauth.mjs";
+import { loadConfig, saveConfig, getConfigPath, VALID_STRATEGIES } from "./lib/config.mjs";
+import { authorize, exchange, revoke, refreshToken } from "./lib/oauth.mjs";
 import { applyOAuthCredentials, resetAccountTracking, adjustActiveIndexAfterRemoval } from "./lib/account-state.mjs";
 import { resolveCliCommandName } from "./lib/commands.mjs";
+import { stripAnsi } from "./lib/util.mjs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { pathToFileURL } from "node:url";
-import { exec } from "node:child_process";
+import { execFile } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 
@@ -107,15 +108,6 @@ function shortPath(p) {
 }
 
 /**
- * Strip ANSI escape codes from a string to get its visible content.
- * @param {string} str
- * @returns {string}
- */
-function stripAnsi(str) {
-  return str.replace(/\x1b\[[0-9;]*m/g, ""); // eslint-disable-line no-control-regex
-}
-
-/**
  * Left-pad a string to a fixed visible width, accounting for ANSI escape codes.
  * @param {string} str
  * @param {number} width
@@ -149,18 +141,7 @@ function rpad(str, width) {
  */
 export async function refreshAccessToken(account) {
   try {
-    const resp = await fetch("https://console.anthropic.com/v1/oauth/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        grant_type: "refresh_token",
-        refresh_token: account.refreshToken,
-        client_id: CLIENT_ID,
-      }),
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!resp.ok) return null;
-    const json = await resp.json();
+    const json = await refreshToken(account.refreshToken, { signal: AbortSignal.timeout(5000) });
     account.access = json.access_token;
     account.expires = Date.now() + json.expires_in * 1000;
     if (json.refresh_token) account.refreshToken = json.refresh_token;
@@ -295,13 +276,14 @@ export function renderUsageLines(usage) {
  * @param {string} url
  */
 function openBrowser(url) {
+  const noop = () => {};
   if (process.platform === "win32") {
-    exec(`cmd /c start "" ${JSON.stringify(url)}`);
+    execFile("cmd", ["/c", "start", "", url]).on("error", noop);
     return;
   }
 
   const cmd = process.platform === "darwin" ? "open" : "xdg-open";
-  exec(`${cmd} ${JSON.stringify(url)}`);
+  execFile(cmd, [url]).on("error", noop);
 }
 
 /**

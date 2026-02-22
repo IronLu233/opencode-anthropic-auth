@@ -4,7 +4,7 @@ Use your Claude Pro or Max subscription with [OpenCode](https://github.com/anoma
 
 ## Quick Start
 
-**Prerequisites:** [OpenCode](https://github.com/anomalyco/opencode) installed, a Claude Pro or Max subscription, Node.js 18+.
+**Prerequisites:** [OpenCode](https://github.com/anomalyco/opencode) installed, a Claude Pro or Max subscription, Node.js 20+.
 
 ```bash
 # 1. Clone and install
@@ -309,7 +309,7 @@ Configuration is stored at `~/.config/opencode/anthropic-auth.json`. All setting
 
   // Outbound request header emulation (Claude Code spoof profile)
   "headers": {
-    // Available: "claude-cli-2.1.50", "claude-cli-latest"
+    // Available: "claude-cli-2.1.50", "claude-cli-default"
     "emulation_profile": "claude-cli-2.1.50",
 
     // Override any default spoofed header
@@ -335,7 +335,7 @@ Header override behavior:
 
 ### Default Emulation Profile
 
-The default profile (`claude-cli-2.1.50`, alias `claude-cli-latest`) sends pinned Claude Code-style headers, including:
+The default profile (`claude-cli-2.1.50`, alias `claude-cli-default`) sends pinned Claude Code-style headers, including:
 
 - `accept: application/json`
 - `anthropic-version: 2023-06-01`
