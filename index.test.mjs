@@ -890,6 +890,17 @@ describe("system prompt transform", () => {
     ).toHaveLength(1);
   });
 
+  it("mutates the system array in place (preserves caller reference)", async () => {
+    const client = makeClient();
+    const plugin = await AnthropicAuthPlugin({ client });
+
+    const system = ["You are a helpful assistant."];
+    const output = { system };
+    plugin["experimental.chat.system.transform"]({ model: { providerID: "anthropic" } }, output);
+
+    expect(output.system).toBe(system); // same object, not a new array
+  });
+
   it("does not modify system for non-anthropic provider", async () => {
     const client = makeClient();
     const plugin = await AnthropicAuthPlugin({ client });

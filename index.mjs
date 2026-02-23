@@ -1139,7 +1139,10 @@ export async function AnthropicAuthPlugin({ client }) {
       if (input.model?.providerID !== "anthropic") return;
       if (!Array.isArray(output.system)) return;
 
-      output.system = output.system.filter((item) => item !== prefix);
+      // Mutate in place — reassigning output.system breaks the caller's reference
+      for (let i = output.system.length - 1; i >= 0; i--) {
+        if (output.system[i] === prefix) output.system.splice(i, 1);
+      }
       output.system.unshift(prefix);
     },
     config: async (input) => {
