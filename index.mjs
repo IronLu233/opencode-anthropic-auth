@@ -8,7 +8,7 @@ import { loadAccounts, saveAccounts, clearAccounts, createDefaultStats } from ".
 import { applyOAuthCredentials, resetAccountTracking } from "./lib/account-state.mjs";
 import { resolveSlashCommandName, isDestructiveCommand, isInteractiveOnlyCommand } from "./lib/commands.mjs";
 import { isAccountSpecificError, parseRateLimitReason, parseRetryAfterHeader } from "./lib/backoff.mjs";
-import { getHeaderProfile, getDefaultBetas } from "./lib/request-headers.mjs";
+import { getHeaderProfile, getDefaultBetas, getBillingHeaderBlock } from "./lib/request-headers.mjs";
 import { stripAnsi } from "./lib/util.mjs";
 
 // ---------------------------------------------------------------------------
@@ -1151,7 +1151,16 @@ export async function AnthropicAuthPlugin({ client }) {
           output.system[i] = output.system[i].slice(prefix.length).replace(/^\n+/, "");
         }
       }
+      // Remove any existing billing header blocks (BUILTIN coexistence dedup).
+      for (let i = output.system.length - 1; i >= 0; i--) {
+        if (typeof output.system[i] === "string" && output.system[i].startsWith("x-anthropic-billing-header:")) {
+          output.system.splice(i, 1);
+        }
+      }
+      // Produce 3-block structure matching official Claude Code:
+      //   [0] billing header  [1] prefix  [2] rest of prompt
       output.system.unshift(prefix);
+      output.system.unshift(getBillingHeaderBlock(config.headers.emulation_profile));
     },
     config: async (input) => {
       input.command ??= {};

@@ -857,18 +857,21 @@ describe("fetch interceptor", () => {
 // ---------------------------------------------------------------------------
 
 describe("system prompt transform", () => {
-  it("prepends Claude Code prefix for anthropic provider", async () => {
+  const BILLING_RE = /^x-anthropic-billing-header: cc_version=[\d.a-z]+; cc_entrypoint=cli; cch=[0-9a-f]{5};$/;
+  const PREFIX = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+  it("produces 3-block structure: billing header, prefix, original prompt", async () => {
     const client = makeClient();
     const plugin = await AnthropicAuthPlugin({ client });
 
     const output = { system: ["You are a helpful assistant."] };
     plugin["experimental.chat.system.transform"]({ model: { providerID: "anthropic" } }, output);
 
-    expect(output.system[0]).toBe("You are Claude Code, Anthropic's official CLI for Claude.");
-    expect(output.system[1]).toBe("You are a helpful assistant.");
-    expect(
-      output.system.filter((item) => item === "You are Claude Code, Anthropic's official CLI for Claude."),
-    ).toHaveLength(1);
+    expect(output.system).toHaveLength(3);
+    expect(output.system[0]).toMatch(BILLING_RE);
+    expect(output.system[1]).toBe(PREFIX);
+    expect(output.system[2]).toBe("You are a helpful assistant.");
+    expect(output.system.filter((item) => item === PREFIX)).toHaveLength(1);
   });
 
   it("deduplicates Claude Code prefix for anthropic provider", async () => {
@@ -876,34 +879,53 @@ describe("system prompt transform", () => {
     const plugin = await AnthropicAuthPlugin({ client });
 
     const output = {
-      system: [
-        "You are Claude Code, Anthropic's official CLI for Claude.",
-        "You are a helpful assistant.",
-        "You are Claude Code, Anthropic's official CLI for Claude.",
-      ],
+      system: [PREFIX, "You are a helpful assistant.", PREFIX],
     };
     plugin["experimental.chat.system.transform"]({ model: { providerID: "anthropic" } }, output);
 
-    expect(output.system[0]).toBe("You are Claude Code, Anthropic's official CLI for Claude.");
-    expect(
-      output.system.filter((item) => item === "You are Claude Code, Anthropic's official CLI for Claude."),
-    ).toHaveLength(1);
+    expect(output.system[0]).toMatch(BILLING_RE);
+    expect(output.system[1]).toBe(PREFIX);
+    expect(output.system.filter((item) => item === PREFIX)).toHaveLength(1);
   });
 
   it("cleans up BUILTIN double-insert pattern (prefix prepended to prompt body)", async () => {
     const client = makeClient();
     const plugin = await AnthropicAuthPlugin({ client });
 
-    const prefix = "You are Claude Code, Anthropic's official CLI for Claude.";
     // Simulates BUILTIN's output: unshift(prefix) + system[1] = prefix + "\n\n" + rest
     const output = {
-      system: [prefix, prefix + "\n\nYou are a helpful assistant."],
+      system: [PREFIX, PREFIX + "\n\nYou are a helpful assistant."],
     };
     plugin["experimental.chat.system.transform"]({ model: { providerID: "anthropic" } }, output);
 
-    expect(output.system[0]).toBe(prefix);
-    expect(output.system[1]).toBe("You are a helpful assistant.");
-    expect(output.system).toHaveLength(2);
+    expect(output.system[0]).toMatch(BILLING_RE);
+    expect(output.system[1]).toBe(PREFIX);
+    expect(output.system[2]).toBe("You are a helpful assistant.");
+    expect(output.system).toHaveLength(3);
+  });
+
+  it("removes duplicate billing header blocks", async () => {
+    const client = makeClient();
+    const plugin = await AnthropicAuthPlugin({ client });
+
+    // Simulates BUILTIN also inserting a billing header
+    const output = {
+      system: [
+        "x-anthropic-billing-header: cc_version=2.1.50.b97; cc_entrypoint=cli; cch=abcde;",
+        PREFIX,
+        "You are a helpful assistant.",
+      ],
+    };
+    plugin["experimental.chat.system.transform"]({ model: { providerID: "anthropic" } }, output);
+
+    expect(output.system[0]).toMatch(BILLING_RE);
+    expect(output.system[1]).toBe(PREFIX);
+    expect(output.system[2]).toBe("You are a helpful assistant.");
+    expect(output.system).toHaveLength(3);
+    // Only one billing header
+    expect(
+      output.system.filter((item) => typeof item === "string" && item.startsWith("x-anthropic-billing-header:")),
+    ).toHaveLength(1);
   });
 
   it("mutates the system array in place (preserves caller reference)", async () => {
