@@ -1139,9 +1139,17 @@ export async function AnthropicAuthPlugin({ client }) {
       if (input.model?.providerID !== "anthropic") return;
       if (!Array.isArray(output.system)) return;
 
-      // Mutate in place — reassigning output.system breaks the caller's reference
+      // Mutate in place — reassigning output.system breaks the caller's reference.
+      // Remove exact matches of the prefix.
       for (let i = output.system.length - 1; i >= 0; i--) {
         if (output.system[i] === prefix) output.system.splice(i, 1);
+      }
+      // Strip prefix prepended to other entries (BUILTIN double-insert pattern:
+      // system[1] = prefix + "\n\n" + rest). Only matches the known pattern.
+      for (let i = 0; i < output.system.length; i++) {
+        if (typeof output.system[i] === "string" && output.system[i].startsWith(prefix + "\n")) {
+          output.system[i] = output.system[i].slice(prefix.length).replace(/^\n+/, "");
+        }
       }
       output.system.unshift(prefix);
     },

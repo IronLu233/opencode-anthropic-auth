@@ -890,6 +890,22 @@ describe("system prompt transform", () => {
     ).toHaveLength(1);
   });
 
+  it("cleans up BUILTIN double-insert pattern (prefix prepended to prompt body)", async () => {
+    const client = makeClient();
+    const plugin = await AnthropicAuthPlugin({ client });
+
+    const prefix = "You are Claude Code, Anthropic's official CLI for Claude.";
+    // Simulates BUILTIN's output: unshift(prefix) + system[1] = prefix + "\n\n" + rest
+    const output = {
+      system: [prefix, prefix + "\n\nYou are a helpful assistant."],
+    };
+    plugin["experimental.chat.system.transform"]({ model: { providerID: "anthropic" } }, output);
+
+    expect(output.system[0]).toBe(prefix);
+    expect(output.system[1]).toBe("You are a helpful assistant.");
+    expect(output.system).toHaveLength(2);
+  });
+
   it("mutates the system array in place (preserves caller reference)", async () => {
     const client = makeClient();
     const plugin = await AnthropicAuthPlugin({ client });
