@@ -1132,10 +1132,11 @@ export async function AnthropicAuthPlugin({ client }) {
     // A1-A4: System prompt transform (unchanged)
     "experimental.chat.system.transform": (input, output) => {
       const prefix = "You are Claude Code, Anthropic's official CLI for Claude.";
-      if (input.model?.providerID === "anthropic") {
-        output.system.unshift(prefix);
-        if (output.system[1]) output.system[1] = prefix + "\n\n" + output.system[1];
-      }
+      if (input.model?.providerID !== "anthropic") return;
+      if (!Array.isArray(output.system)) return;
+
+      output.system = output.system.filter((item) => item !== prefix);
+      output.system.unshift(prefix);
     },
     config: async (input) => {
       input.command ??= {};

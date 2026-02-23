@@ -842,8 +842,29 @@ describe("system prompt transform", () => {
     plugin["experimental.chat.system.transform"]({ model: { providerID: "anthropic" } }, output);
 
     expect(output.system[0]).toBe("You are Claude Code, Anthropic's official CLI for Claude.");
-    expect(output.system[1]).toContain("You are Claude Code");
-    expect(output.system[1]).toContain("You are a helpful assistant.");
+    expect(output.system[1]).toBe("You are a helpful assistant.");
+    expect(
+      output.system.filter((item) => item === "You are Claude Code, Anthropic's official CLI for Claude."),
+    ).toHaveLength(1);
+  });
+
+  it("deduplicates Claude Code prefix for anthropic provider", async () => {
+    const client = makeClient();
+    const plugin = await AnthropicAuthPlugin({ client });
+
+    const output = {
+      system: [
+        "You are Claude Code, Anthropic's official CLI for Claude.",
+        "You are a helpful assistant.",
+        "You are Claude Code, Anthropic's official CLI for Claude.",
+      ],
+    };
+    plugin["experimental.chat.system.transform"]({ model: { providerID: "anthropic" } }, output);
+
+    expect(output.system[0]).toBe("You are Claude Code, Anthropic's official CLI for Claude.");
+    expect(
+      output.system.filter((item) => item === "You are Claude Code, Anthropic's official CLI for Claude."),
+    ).toHaveLength(1);
   });
 
   it("does not modify system for non-anthropic provider", async () => {
