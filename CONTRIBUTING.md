@@ -70,7 +70,7 @@ opencode-anthropic-auth/
     build.mjs            esbuild bundler (produces dist/)
     install.mjs          Unified installer (link/copy/uninstall)
   dist/                  Build output (gitignored)
-    opencode-anthropic-auth-plugin.js   Bundled plugin (self-contained)
+    opencode-anthropic-auth.js          Bundled plugin (self-contained)
     opencode-anthropic-auth-cli.mjs     Bundled CLI (self-contained)
   test/helpers/
     accounts-fixtures.mjs  Shared test account fixture builders

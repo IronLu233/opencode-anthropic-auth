@@ -3,7 +3,7 @@
 /**
  * Bundle plugin and CLI into self-contained single files.
  *
- *   dist/opencode-anthropic-auth-plugin.js  — plugin (no external deps)
+ *   dist/opencode-anthropic-auth.js         — plugin (no external deps)
  *   dist/opencode-anthropic-auth-cli.mjs    — CLI    (no external deps)
  */
 
@@ -22,7 +22,7 @@ await Promise.all([
   build({
     ...shared,
     entryPoints: ["index.mjs"],
-    outfile: "dist/opencode-anthropic-auth-plugin.js",
+    outfile: "dist/opencode-anthropic-auth.js",
   }),
   build({
     ...shared,
@@ -31,4 +31,4 @@ await Promise.all([
   }),
 ]);
 
-console.log("Built dist/opencode-anthropic-auth-plugin.js and dist/opencode-anthropic-auth-cli.mjs");
+console.log("Built dist/opencode-anthropic-auth.js and dist/opencode-anthropic-auth-cli.mjs");

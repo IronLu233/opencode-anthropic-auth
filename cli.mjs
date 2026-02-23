@@ -1681,7 +1681,7 @@ export async function main(argv, options = {}) {
 async function detectMain() {
   if (!process.argv[1]) return false;
   if (import.meta.url === pathToFileURL(process.argv[1]).href) return true;
-  // Handle symlinks (e.g., ~/.config/opencode/plugin/opencode-anthropic-auth-plugin.js → index.mjs)
+  // Handle symlinks (e.g., ~/.config/opencode/plugin/opencode-anthropic-auth.js → index.mjs)
   try {
     const { realpath } = await import("node:fs/promises");
     const resolved = await realpath(process.argv[1]);

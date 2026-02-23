@@ -602,6 +602,29 @@ describe("fetch interceptor", () => {
     expect(body.system[0].text).toBe("You are Claude Code, an Claude assistant.");
   });
 
+  it("strips OpenCode identity line from system prompt", async () => {
+    mockFetch.mockResolvedValueOnce(new Response("", { status: 200 }));
+
+    await fetchFn("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        system: [
+          {
+            type: "text",
+            text: "You are OpenCode, the best coding agent on the planet.\n\nYou are an interactive CLI tool.",
+          },
+        ],
+        messages: [],
+      }),
+    });
+
+    const [, init] = mockFetch.mock.calls[0];
+    const body = JSON.parse(init.body);
+    // Identity line stripped; remaining text still gets OpenCode->Claude Code rewrite
+    expect(body.system[0].text).not.toContain("best coding agent on the planet");
+    expect(body.system[0].text).toContain("You are an interactive CLI tool.");
+  });
+
   it("preserves paths containing opencode in system prompt", async () => {
     mockFetch.mockResolvedValueOnce(new Response("", { status: 200 }));
 

@@ -4,7 +4,7 @@
  * Installation script for opencode-anthropic-auth.
  *
  * Installs two things:
- *   1. Plugin  → ~/.config/opencode/plugin/opencode-anthropic-auth-plugin.js
+ *   1. Plugin  → ~/.config/opencode/plugin/opencode-anthropic-auth.js
  *   2. CLI     → ~/.local/bin/opencode-anthropic-auth
  *
  * Usage:
@@ -27,7 +27,7 @@ import { fileURLToPath } from "node:url";
 const __filename = fileURLToPath(import.meta.url);
 const PROJECT_ROOT = resolve(dirname(__filename), "..");
 const PLUGIN_NAME = "opencode-anthropic-auth";
-const PLUGIN_ENTRY = "opencode-anthropic-auth-plugin.js";
+const PLUGIN_ENTRY = "opencode-anthropic-auth.js";
 const CLI_BIN_NAME = "opencode-anthropic-auth";
 
 /**
@@ -170,10 +170,10 @@ async function cmdLink() {
   const pluginTarget = join(PROJECT_ROOT, "index.mjs");
 
   // Clean up old-named entry if present
-  const oldEntry = join(pluginDir, "opencode-anthropic-auth.js");
+  const oldEntry = join(pluginDir, "opencode-anthropic-auth-plugin.js");
   if (existsSync(oldEntry) && oldEntry !== pluginEntry) {
     await unlink(oldEntry);
-    console.log(dim("Plugin: removed old opencode-anthropic-auth.js"));
+    console.log(dim("Plugin: removed old opencode-anthropic-auth-plugin.js"));
   }
 
   await ensureSymlink(pluginTarget, pluginEntry, "Plugin");
@@ -203,7 +203,7 @@ async function cmdLink() {
 async function cmdCopy() {
   console.log(bold("Copying opencode-anthropic-auth...\n"));
 
-  const pluginSrc = join(DIST_DIR, "opencode-anthropic-auth-plugin.js");
+  const pluginSrc = join(DIST_DIR, "opencode-anthropic-auth.js");
   const cliSrc = join(DIST_DIR, "opencode-anthropic-auth-cli.mjs");
 
   if (!existsSync(pluginSrc) || !existsSync(cliSrc)) {
@@ -264,7 +264,7 @@ async function cmdUninstall() {
   const pluginDir = getPluginDir();
   const pluginEntry = join(pluginDir, PLUGIN_ENTRY);
   if (await removePath(pluginEntry, "Plugin")) removed = true;
-  const oldEntry = join(pluginDir, "opencode-anthropic-auth.js");
+  const oldEntry = join(pluginDir, "opencode-anthropic-auth-plugin.js");
   if (await removePath(oldEntry, "Plugin (old name)")) removed = true;
 
   // Plugin copy directory

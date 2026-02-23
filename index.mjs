@@ -229,7 +229,11 @@ function transformRequestBody(body) {
         if (item.type === "text" && item.text) {
           return {
             ...item,
-            text: item.text.replace(/OpenCode/g, "Claude Code").replace(/(?<!\/)opencode/gi, "Claude"),
+            // Strip the OpenCode identity line — the transform hook provides the correct Claude Code identity
+            text: item.text
+              .replace(/^You are OpenCode, the best coding agent on the planet\.\n*/m, "")
+              .replace(/OpenCode/g, "Claude Code")
+              .replace(/(?<!\/)opencode/gi, "Claude"),
           };
         }
         return item;

@@ -45,7 +45,7 @@ npm run install:link
 
 This creates:
 
-- **Plugin:** `~/.config/opencode/plugin/opencode-anthropic-auth-plugin.js` &rarr; `./index.mjs`
+- **Plugin:** `~/.config/opencode/plugin/opencode-anthropic-auth.js` &rarr; `./index.mjs`
 - **CLI:** `~/.local/bin/opencode-anthropic-auth` &rarr; `./cli.mjs`
 
 ### Stable (copy)
@@ -58,7 +58,7 @@ npm run install:copy
 
 This creates:
 
-- **Plugin:** `~/.config/opencode/plugin/opencode-anthropic-auth-plugin.js` (standalone, ~50KB)
+- **Plugin:** `~/.config/opencode/plugin/opencode-anthropic-auth.js` (standalone, ~50KB)
 - **CLI:** `~/.local/bin/opencode-anthropic-auth` (standalone, ~35KB)
 
 ### Uninstall
@@ -380,12 +380,12 @@ The plugin also:
 
 ## Files
 
-| Path                                                          | Description                            |
-| ------------------------------------------------------------- | -------------------------------------- |
-| `~/.config/opencode/anthropic-auth.json`                      | Plugin configuration                   |
-| `~/.config/opencode/anthropic-accounts.json`                  | Account credentials (0600 permissions) |
-| `~/.config/opencode/plugin/opencode-anthropic-auth-plugin.js` | Installed plugin entry point           |
-| `~/.local/bin/opencode-anthropic-auth`                        | CLI binary                             |
+| Path                                                   | Description                            |
+| ------------------------------------------------------ | -------------------------------------- |
+| `~/.config/opencode/anthropic-auth.json`               | Plugin configuration                   |
+| `~/.config/opencode/anthropic-accounts.json`           | Account credentials (0600 permissions) |
+| `~/.config/opencode/plugin/opencode-anthropic-auth.js` | Installed plugin entry point           |
+| `~/.local/bin/opencode-anthropic-auth`                 | CLI binary                             |
 
 Account credentials are stored with restrictive file permissions (owner read/write only) and are excluded from git via an auto-generated `.gitignore`.
 
