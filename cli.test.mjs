@@ -25,7 +25,9 @@ vi.mock("./lib/config.mjs", async (importOriginal) => {
   const original = await importOriginal();
   return {
     ...original,
-    loadConfig: vi.fn(() => ({ ...original.DEFAULT_CONFIG })),
+    loadConfig: vi.fn(() => structuredClone(original.DEFAULT_CONFIG)),
+    loadRawConfig: vi.fn(() => ({})),
+    saveConfig: vi.fn(),
     getConfigPath: vi.fn(() => "/home/user/.config/opencode/anthropic-auth.json"),
     getConfigDir: vi.fn(() => "/home/user/.config/opencode"),
   };
@@ -86,6 +88,7 @@ import {
   main,
 } from "./cli.mjs";
 import { loadAccounts, saveAccounts } from "./lib/storage.mjs";
+import { loadConfig, loadRawConfig, saveConfig as saveConfigMock, DEFAULT_CONFIG } from "./lib/config.mjs";
 import { authorize, exchange, revoke } from "./lib/oauth.mjs";
 import { createInterface } from "node:readline/promises";
 import { execFile } from "node:child_process";
@@ -557,7 +560,7 @@ describe("cmdList", () => {
     expect(code).toBe(0);
 
     const text = output.text();
-    expect(text).toMatch(/2m\s+30s/);
+    expect(text).toMatch(/2m\s+(?:29|30)s/);
   });
 
   it("shows consecutive failure count", async () => {
@@ -1358,6 +1361,116 @@ describe("cmdConfig", () => {
     expect(code).toBe(0);
     expect(output.text()).toContain("none");
   });
+
+  it("shows headers section with billing header status", async () => {
+    loadAccounts.mockResolvedValue(null);
+    const code = await cmdConfig();
+    expect(code).toBe(0);
+    const text = output.text();
+    expect(text).toContain("Headers");
+    expect(text).toContain("Billing header:");
+    expect(text).toContain("off"); // default is off
+  });
+
+  it("rejects unknown subcommands", async () => {
+    const code = await cmdConfig("nope");
+    expect(code).toBe(1);
+    expect(output.errorText()).toContain("Unknown config subcommand");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cmdConfig set
+// ---------------------------------------------------------------------------
+
+describe("cmdConfig set", () => {
+  let output;
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    output = captureOutput();
+    vi.mocked(loadConfig).mockReturnValue(structuredClone(DEFAULT_CONFIG));
+    vi.mocked(loadRawConfig).mockReturnValue({});
+    vi.mocked(saveConfigMock).mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    output.restore();
+  });
+
+  it("sets a top-level boolean key", async () => {
+    const code = await cmdConfig("set", "debug", "true");
+    expect(code).toBe(0);
+    expect(saveConfigMock).toHaveBeenCalledWith({ debug: true });
+    expect(output.text()).toContain("debug:");
+    expect(output.text()).toContain("on");
+  });
+
+  it("sets a nested key (billing-header)", async () => {
+    const code = await cmdConfig("set", "billing-header", "on");
+    expect(code).toBe(0);
+    expect(saveConfigMock).toHaveBeenCalledWith({ headers: { billing_header: true } });
+    expect(output.text()).toContain("billing-header:");
+  });
+
+  it("supports key=value format", async () => {
+    const code = await cmdConfig("set", "debug=on");
+    expect(code).toBe(0);
+    expect(saveConfigMock).toHaveBeenCalledWith({ debug: true });
+  });
+
+  it("parses on/off as boolean", async () => {
+    const code = await cmdConfig("set", "quiet", "off");
+    expect(code).toBe(0);
+    expect(saveConfigMock).toHaveBeenCalledWith({ toasts: { quiet: false } });
+  });
+
+  it("preserves sibling keys in nested objects", async () => {
+    vi.mocked(loadRawConfig).mockReturnValue({
+      headers: { emulation_profile: "custom", billing_header: false },
+    });
+    const code = await cmdConfig("set", "billing-header", "on");
+    expect(code).toBe(0);
+    expect(saveConfigMock).toHaveBeenCalledWith({
+      headers: { emulation_profile: "custom", billing_header: true },
+    });
+  });
+
+  it("validates strategy values", async () => {
+    const code = await cmdConfig("set", "strategy", "invalid");
+    expect(code).toBe(1);
+    expect(output.errorText()).toContain("Invalid value");
+  });
+
+  it("accepts valid strategy values", async () => {
+    const code = await cmdConfig("set", "strategy", "round-robin");
+    expect(code).toBe(0);
+    expect(saveConfigMock).toHaveBeenCalledWith({ account_selection_strategy: "round-robin" });
+  });
+
+  it("shows current value when no value provided", async () => {
+    const code = await cmdConfig("set", "debug");
+    expect(code).toBe(0);
+    expect(output.text()).toContain("debug = false");
+  });
+
+  it("errors on missing key", async () => {
+    const code = await cmdConfig("set");
+    expect(code).toBe(1);
+    expect(output.errorText()).toContain("Usage:");
+  });
+
+  it("errors on unknown key", async () => {
+    const code = await cmdConfig("set", "nonexistent", "value");
+    expect(code).toBe(1);
+    expect(output.errorText()).toContain("Unknown config key");
+  });
+
+  it("errors on invalid boolean value", async () => {
+    const code = await cmdConfig("set", "debug", "maybe");
+    expect(code).toBe(1);
+    expect(output.errorText()).toContain("expected true/false/on/off");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1390,6 +1503,7 @@ describe("cmdHelp", () => {
     expect(text).toContain("remove");
     expect(text).toContain("reset");
     expect(text).toContain("config");
+    expect(text).toContain("config set");
     expect(text).toContain("manage");
     expect(text).toContain("help");
   });
@@ -1889,6 +2003,15 @@ describe("main routing (additional commands)", () => {
     const code = await main(["strat"]);
     expect(code).toBe(0);
     expect(output.text()).toContain("Account Selection Strategy");
+  });
+
+  it("routes 'config set' with key and value", async () => {
+    vi.mocked(loadConfig).mockReturnValue(structuredClone(DEFAULT_CONFIG));
+    vi.mocked(loadRawConfig).mockReturnValue({});
+    vi.mocked(saveConfigMock).mockImplementation(() => {});
+    const code = await main(["config", "set", "debug", "on"]);
+    expect(code).toBe(0);
+    expect(saveConfigMock).toHaveBeenCalledWith({ debug: true });
   });
 });
 

@@ -25,12 +25,13 @@
  *   reset-stats [N|all] Reset usage statistics
  *   strategy [name]   Show or change account selection strategy
  *   config            Show current configuration and file paths
+ *   config set <k> <v> Set a config value
  *   manage            Interactive account management menu
  *   help              Show this help message
  */
 
 import { loadAccounts, saveAccounts, getStoragePath, createDefaultStats } from "./lib/storage.mjs";
-import { loadConfig, saveConfig, getConfigPath, VALID_STRATEGIES } from "./lib/config.mjs";
+import { loadConfig, loadRawConfig, saveConfig, getConfigPath, VALID_STRATEGIES } from "./lib/config.mjs";
 import { authorize, exchange, revoke, refreshToken } from "./lib/oauth.mjs";
 import { applyOAuthCredentials, resetAccountTracking, adjustActiveIndexAfterRemoval } from "./lib/account-state.mjs";
 import { resolveCliCommandName } from "./lib/commands.mjs";
@@ -1032,7 +1033,152 @@ export async function cmdReset(arg) {
  * Show current configuration.
  * @returns {Promise<number>} exit code
  */
-export async function cmdConfig() {
+/**
+ * Lookup table mapping friendly CLI key names to config paths and types.
+ * @type {Record<string, { path: string[], type: "boolean" | "string" | "number", validate?: (v: string) => boolean }>}
+ */
+const SETTABLE_KEYS = {
+  "billing-header": { path: ["headers", "billing_header"], type: "boolean" },
+  debug: { path: ["debug"], type: "boolean" },
+  quiet: { path: ["toasts", "quiet"], type: "boolean" },
+  strategy: { path: ["account_selection_strategy"], type: "string", validate: (v) => VALID_STRATEGIES.includes(v) },
+};
+
+/**
+ * Parse a string value into the appropriate JS type.
+ * @param {string} raw
+ * @param {"boolean" | "string" | "number"} type
+ * @returns {{ ok: true, value: unknown } | { ok: false, reason: string }}
+ */
+function parseValue(raw, type) {
+  if (type === "boolean") {
+    const lower = raw.toLowerCase();
+    if (lower === "true" || lower === "on" || lower === "1") return { ok: true, value: true };
+    if (lower === "false" || lower === "off" || lower === "0") return { ok: true, value: false };
+    return { ok: false, reason: `expected true/false/on/off, got '${raw}'` };
+  }
+  if (type === "number") {
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return { ok: false, reason: `expected a number, got '${raw}'` };
+    return { ok: true, value: n };
+  }
+  return { ok: true, value: raw };
+}
+
+/**
+ * Get a nested value from an object by path.
+ * @param {Record<string, unknown>} obj
+ * @param {string[]} path
+ * @returns {unknown}
+ */
+function getByPath(obj, path) {
+  let current = obj;
+  for (const key of path) {
+    if (current == null || typeof current !== "object") return undefined;
+    current = /** @type {Record<string, unknown>} */ (current)[key];
+  }
+  return current;
+}
+
+/**
+ * Handle `config set <key> <value>`.
+ * @param {string} keyArg - Key name or key=value
+ * @param {string} [valueArg] - Value (if not in key=value format)
+ * @returns {number} exit code
+ */
+function cmdConfigSet(keyArg, valueArg) {
+  if (!keyArg) {
+    console.error(c.red("Usage: config set <key> <value>"));
+    console.error("");
+    console.error(c.dim("Settable keys:"));
+    for (const [name, meta] of Object.entries(SETTABLE_KEYS)) {
+      console.error(c.dim("  ") + c.cyan(name) + c.dim(` (${meta.type})`));
+    }
+    return 1;
+  }
+
+  // Support key=value or key value
+  let key = keyArg;
+  let rawValue = valueArg;
+  if (key.includes("=") && rawValue === undefined) {
+    const idx = key.indexOf("=");
+    rawValue = key.slice(idx + 1);
+    key = key.slice(0, idx);
+  }
+
+  const meta = SETTABLE_KEYS[key];
+  if (!meta) {
+    console.error(c.red(`Unknown config key: '${key}'`));
+    console.error(c.dim("Settable keys: " + Object.keys(SETTABLE_KEYS).join(", ")));
+    return 1;
+  }
+
+  if (rawValue === undefined || rawValue === "") {
+    // Show current value
+    const config = loadConfig();
+    const current = getByPath(/** @type {Record<string, unknown>} */ (config), meta.path);
+    console.log(`${key} = ${JSON.stringify(current)}`);
+    return 0;
+  }
+
+  const parsed = parseValue(rawValue, meta.type);
+  if (!parsed.ok) {
+    console.error(c.red(`Invalid value for '${key}': ${parsed.reason}`));
+    return 1;
+  }
+
+  if (meta.validate && !meta.validate(String(parsed.value))) {
+    console.error(c.red(`Invalid value for '${key}': '${rawValue}'`));
+    if (key === "strategy") {
+      console.error(c.dim(`Valid values: ${VALID_STRATEGIES.join(", ")}`));
+    }
+    return 1;
+  }
+
+  // Build the update object, preserving existing nested keys
+  const raw = loadRawConfig();
+  const oldConfig = loadConfig();
+  const oldValue = getByPath(/** @type {Record<string, unknown>} */ (oldConfig), meta.path);
+
+  /** @type {Record<string, unknown>} */
+  let update;
+  if (meta.path.length === 1) {
+    update = { [meta.path[0]]: parsed.value };
+  } else {
+    // Deep: reconstruct the nested object preserving siblings
+    const topKey = meta.path[0];
+    const existing =
+      raw[topKey] && typeof raw[topKey] === "object" ? { .../** @type {Record<string, unknown>} */ (raw[topKey]) } : {};
+    existing[meta.path[1]] = parsed.value;
+    update = { [topKey]: existing };
+  }
+
+  saveConfig(update);
+
+  const display = (v) => (typeof v === "boolean" ? (v ? "on" : "off") : JSON.stringify(v));
+  console.log(c.green(`${key}: ${display(oldValue)} → ${display(parsed.value)}`));
+  return 0;
+}
+
+/**
+ * Show configuration or handle `config set`.
+ * @param {...string} args - Subcommand args: [] for display, ["set", key, value] for set
+ * @returns {Promise<number>} exit code
+ */
+export async function cmdConfig(...args) {
+  const subcommand = args[0];
+
+  if (subcommand === "set") {
+    // config set key value  OR  config set key=value
+    return cmdConfigSet(args[1], args[2]);
+  }
+
+  if (subcommand) {
+    console.error(c.red(`Unknown config subcommand: '${subcommand}'`));
+    console.error(c.dim("Usage: config [set <key> <value>]"));
+    return 1;
+  }
+
   const config = loadConfig();
   const stored = await loadAccounts();
 
@@ -1058,6 +1204,17 @@ export async function cmdConfig() {
   console.log(c.dim("  Max tokens:      ") + `${config.token_bucket.max_tokens}`);
   console.log(c.dim("  Regen/min:       ") + `${config.token_bucket.regeneration_rate_per_minute}`);
   console.log(c.dim("  Initial:         ") + `${config.token_bucket.initial_tokens}`);
+  console.log("");
+
+  console.log(c.dim("Headers"));
+  console.log(c.dim("  Profile:         ") + c.cyan(config.headers.emulation_profile));
+  console.log(c.dim("  Billing header:  ") + (config.headers.billing_header ? c.yellow("on") : c.dim("off")));
+  if (config.headers.disable.length > 0) {
+    console.log(c.dim("  Disabled:        ") + config.headers.disable.join(", "));
+  }
+  if (Object.keys(config.headers.overrides).length > 0) {
+    console.log(c.dim("  Overrides:       ") + `${Object.keys(config.headers.overrides).length} key(s)`);
+  }
   console.log("");
 
   console.log(c.dim("Files"));
@@ -1516,6 +1673,7 @@ ${c.dim("Account Commands:")}
   ${pad(c.cyan("reset-stats") + " [N|all]", 22)}Reset usage statistics
   ${pad(c.cyan("strategy") + " [name]", 22)}Show or change selection strategy
   ${pad(c.cyan("config"), 22)}Show configuration and file paths
+  ${pad(c.cyan("config set") + " <k> <v>", 22)}Set a config value (keys: ${Object.keys(SETTABLE_KEYS).join(", ")})
   ${pad(c.cyan("manage"), 22)}Interactive account management menu
   ${pad(c.cyan("help"), 22)}Show this help message
 
@@ -1536,6 +1694,7 @@ ${c.dim("Examples:")}
   ${bin} reset all         ${c.dim("# Clear all rate-limit tracking")}
   ${bin} strategy sticky   ${c.dim("# Switch to sticky mode")}
   ${bin} stats             ${c.dim("# Show token usage per account")}
+  ${bin} config set debug on ${c.dim("# Enable debug logging")}
   ${bin} status            ${c.dim("# One-liner for shell prompt")}
 
 ${c.dim("Files:")}
@@ -1652,7 +1811,7 @@ async function dispatch(argv) {
     case "strategy":
       return cmdStrategy(arg);
     case "config":
-      return cmdConfig();
+      return cmdConfig(...args.slice(1));
     case "manage":
       return cmdManage();
     case "help":
