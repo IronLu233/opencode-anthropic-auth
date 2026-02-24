@@ -1157,10 +1157,10 @@ export async function AnthropicAuthPlugin({ client }) {
           output.system.splice(i, 1);
         }
       }
-      // Produce 3-block structure matching official Claude Code:
-      //   [0] billing header  [1] prefix  [2] rest of prompt
       output.system.unshift(prefix);
-      output.system.unshift(getBillingHeaderBlock(config.headers.emulation_profile));
+      if (config.headers.billing_header) {
+        output.system.unshift(getBillingHeaderBlock(config.headers.emulation_profile));
+      }
     },
     config: async (input) => {
       input.command ??= {};
