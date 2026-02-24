@@ -927,7 +927,6 @@ describe("system prompt transform", () => {
   it("includes billing header when config enables it", async () => {
     const client = makeClient();
     // Enable billing_header via config mock
-    const { loadConfig: realLoadConfig } = await import("./lib/config.mjs");
     const { loadConfig } = await import("./lib/config.mjs");
     loadConfig.mockReturnValue({
       ...DEFAULT_CONFIG,
