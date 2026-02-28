@@ -45,7 +45,10 @@ vi.mock("./lib/config.mjs", async (importOriginal) => {
   const original = await importOriginal();
   return {
     ...original,
-    loadConfig: vi.fn(() => ({ ...original.DEFAULT_CONFIG })),
+    loadConfig: vi.fn(() => ({
+      ...original.DEFAULT_CONFIG,
+      idle_refresh: { ...original.DEFAULT_CONFIG.idle_refresh, enabled: false },
+    })),
   };
 });
 
@@ -84,6 +87,24 @@ function makeProvider() {
       },
     },
   };
+}
+
+/**
+ * Poll until condition passes or timeout.
+ * @param {() => void} assertion
+ * @param {number} [timeoutMs]
+ */
+async function waitForAssertion(assertion, timeoutMs = 500) {
+  const started = Date.now();
+  while (true) {
+    try {
+      assertion();
+      return;
+    } catch (err) {
+      if (Date.now() - started >= timeoutMs) throw err;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
 }
 
 /**
@@ -1148,6 +1169,181 @@ describe("fetch interceptor — token refresh", () => {
     const refreshCalls = mockFetch.mock.calls.filter(([u]) => String(u).includes("/v1/oauth/token"));
     expect(refreshCalls).toHaveLength(1);
     expect(apiAuthHeaders).toEqual(["Bearer fresh-access", "Bearer fresh-access"]);
+  });
+
+  it("refreshes near-expiry idle account in background while serving active account", async () => {
+    loadConfig.mockReturnValue({
+      ...DEFAULT_CONFIG,
+      idle_refresh: { ...DEFAULT_CONFIG.idle_refresh, enabled: true },
+    });
+
+    loadAccounts.mockResolvedValue(
+      makeAccountsData([
+        { access: "access-1", expires: Date.now() + 2 * 3600_000 },
+        { refreshToken: "refresh-2", access: "access-2", expires: Date.now() + 10 * 60_000 },
+      ]),
+    );
+    saveAccounts.mockResolvedValue(undefined);
+
+    const plugin = await AnthropicAuthPlugin({ client });
+    const getAuth = vi.fn().mockResolvedValue({
+      type: "oauth",
+      refresh: "refresh-1",
+      access: "access-1",
+      expires: Date.now() + 2 * 3600_000,
+    });
+    const result = await plugin.auth.loader(getAuth, makeProvider());
+
+    mockFetch.mockImplementation((url) => {
+      const s = String(url);
+      if (s.includes("/v1/oauth/token")) {
+        return Promise.resolve(mockTokenRefresh("idle-fresh-access", "refresh-2-rotated"));
+      }
+      return Promise.resolve(new Response('{"content":[]}', { status: 200 }));
+    });
+
+    const response = await result.fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({ messages: [] }),
+    });
+    expect(response.status).toBe(200);
+
+    await waitForAssertion(() => {
+      const refreshCalls = mockFetch.mock.calls.filter(([u]) => String(u).includes("/v1/oauth/token"));
+      expect(refreshCalls.length).toBe(1);
+    });
+
+    const refreshCalls = mockFetch.mock.calls.filter(([u]) => String(u).includes("/v1/oauth/token"));
+    const refreshBody = new URLSearchParams(refreshCalls[0][1].body);
+    expect(refreshBody.get("refresh_token")).toBe("refresh-2");
+  });
+
+  it("does not disable idle account on background refresh failure", async () => {
+    loadConfig.mockReturnValue({
+      ...DEFAULT_CONFIG,
+      idle_refresh: { ...DEFAULT_CONFIG.idle_refresh, enabled: true },
+    });
+
+    loadAccounts.mockResolvedValue(
+      makeAccountsData([
+        { access: "access-1", expires: Date.now() + 2 * 3600_000 },
+        { refreshToken: "refresh-2", access: "access-2", expires: Date.now() + 10 * 60_000 },
+      ]),
+    );
+    saveAccounts.mockResolvedValue(undefined);
+
+    const plugin = await AnthropicAuthPlugin({ client });
+    const getAuth = vi.fn().mockResolvedValue({
+      type: "oauth",
+      refresh: "refresh-1",
+      access: "access-1",
+      expires: Date.now() + 2 * 3600_000,
+    });
+    const result = await plugin.auth.loader(getAuth, makeProvider());
+
+    // Background idle refresh fails terminally and retry fails too.
+    mockFetch.mockImplementation((url) => {
+      const s = String(url);
+      if (s.includes("/v1/oauth/token")) {
+        return Promise.resolve({
+          ok: false,
+          status: 400,
+          text: async () => JSON.stringify({ error: "invalid_grant" }),
+        });
+      }
+      return Promise.resolve(new Response('{"content":[]}', { status: 200 }));
+    });
+
+    const response = await result.fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({ messages: [] }),
+    });
+    expect(response.status).toBe(200);
+
+    await waitForAssertion(() => {
+      const refreshCalls = mockFetch.mock.calls.filter(([u]) => String(u).includes("/v1/oauth/token"));
+      expect(refreshCalls.length).toBeGreaterThanOrEqual(2);
+    });
+
+    // Background maintenance should not auto-disable accounts.
+    const disabledToasts = client.tui.showToast.mock.calls.filter(([arg]) =>
+      String(arg?.body?.message || "").includes("Disabled"),
+    );
+    expect(disabledToasts).toHaveLength(0);
+
+    for (const [storage] of saveAccounts.mock.calls) {
+      expect(storage.accounts[1]?.enabled).not.toBe(false);
+    }
+  });
+
+  it("foreground refresh does not inherit an in-flight idle refresh failure", async () => {
+    loadConfig.mockReturnValue({
+      ...DEFAULT_CONFIG,
+      idle_refresh: { ...DEFAULT_CONFIG.idle_refresh, enabled: true },
+    });
+
+    loadAccounts.mockResolvedValue(
+      makeAccountsData([
+        { access: "access-1", expires: Date.now() + 2 * 3600_000 },
+        { refreshToken: "refresh-2", access: "stale-access-2", expires: Date.now() - 1000 },
+      ]),
+    );
+    saveAccounts.mockResolvedValue(undefined);
+
+    const plugin = await AnthropicAuthPlugin({ client });
+    const getAuth = vi.fn().mockResolvedValue({
+      type: "oauth",
+      refresh: "refresh-1",
+      access: "access-1",
+      expires: Date.now() + 2 * 3600_000,
+    });
+    const result = await plugin.auth.loader(getAuth, makeProvider());
+
+    /** @type {(error: Error) => void} */
+    let rejectIdleRefresh;
+    const idleRefreshPromise = new Promise((_, reject) => {
+      rejectIdleRefresh = reject;
+    });
+
+    let oauthCount = 0;
+    mockFetch.mockImplementation((url, init) => {
+      const s = String(url);
+      const headers = new Headers(init?.headers ?? undefined);
+
+      if (s.includes("/v1/oauth/token")) {
+        oauthCount += 1;
+        if (oauthCount === 1) return idleRefreshPromise;
+        return Promise.resolve(mockTokenRefresh("fresh-access-2", "refresh-2-rotated"));
+      }
+
+      // First request on account 1 fails account-specific so flow switches to account 2.
+      if (headers.get("authorization") === "Bearer access-1") {
+        // Let idle refresh fail while foreground is preparing to use account 2.
+        rejectIdleRefresh(new Error("idle refresh failed"));
+        return Promise.resolve(
+          new Response('{"error":{"type":"rate_limit_error","message":"Rate limit"}}', { status: 429 }),
+        );
+      }
+
+      return Promise.resolve(new Response('{"content":[]}', { status: 200 }));
+    });
+
+    const response = await result.fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({ messages: [] }),
+    });
+
+    expect(response.status).toBe(200);
+
+    const oauthCalls = mockFetch.mock.calls.filter(([u]) => String(u).includes("/v1/oauth/token"));
+    expect(oauthCalls).toHaveLength(2);
+    const secondBody = new URLSearchParams(oauthCalls[1][1].body);
+    expect(secondBody.get("refresh_token")).toBe("refresh-2");
+
+    const disabledToasts = client.tui.showToast.mock.calls.filter(([arg]) =>
+      String(arg?.body?.message || "").includes("Disabled"),
+    );
+    expect(disabledToasts).toHaveLength(0);
   });
 
   it("disables account on 401 token refresh failure and retries with next account", async () => {

@@ -794,8 +794,17 @@ export async function AnthropicAuthPlugin({ client }) {
   /** @type {Map<string, number>} */
   const debouncedToastTimestamps = new Map();
 
-  /** @type {Map<string, Promise<string>>} */
+  /** @type {Map<string, { promise: Promise<string>, source: "foreground" | "idle" }>} */
   const refreshInFlight = new Map();
+
+  /** @type {Map<string, number>} */
+  const idleRefreshLastAttempt = new Map();
+  /** @type {Set<string>} */
+  const idleRefreshInFlight = new Set();
+
+  const IDLE_REFRESH_ENABLED = config.idle_refresh.enabled;
+  const IDLE_REFRESH_WINDOW_MS = config.idle_refresh.window_minutes * 60 * 1000;
+  const IDLE_REFRESH_MIN_INTERVAL_MS = config.idle_refresh.min_interval_minutes * 60 * 1000;
 
   /**
    * Pending slash-command OAuth flows keyed by session ID.
@@ -1169,28 +1178,150 @@ export async function AnthropicAuthPlugin({ client }) {
   }
 
   /**
+   * Parse refresh error details for retry/disable decisions.
+   * @param {unknown} refreshError
+   * @returns {{message: string, status: number, errorCode: string, isInvalidGrant: boolean, isTerminalStatus: boolean}}
+   */
+  function parseRefreshFailure(refreshError) {
+    const message = refreshError instanceof Error ? refreshError.message : String(refreshError);
+    const status =
+      typeof refreshError === "object" && refreshError && "status" in refreshError ? Number(refreshError.status) : NaN;
+    const errorCode =
+      typeof refreshError === "object" && refreshError && ("errorCode" in refreshError || "code" in refreshError)
+        ? String(refreshError.errorCode || refreshError.code || "")
+        : "";
+    const msgLower = message.toLowerCase();
+    const isInvalidGrant =
+      errorCode === "invalid_grant" || errorCode === "invalid_request" || msgLower.includes("invalid_grant");
+    const isTerminalStatus = status === 400 || status === 401 || status === 403;
+    return { message, status, errorCode, isInvalidGrant, isTerminalStatus };
+  }
+
+  /**
    * Refresh a specific account token with single-flight protection.
    * Prevents concurrent refresh races from disabling healthy accounts.
    * @param {import('./lib/accounts.mjs').ManagedAccount} account
+   * @param {"foreground" | "idle"} [source]
    * @returns {Promise<string>}
    */
-  async function refreshAccountTokenSingleFlight(account) {
+  async function refreshAccountTokenSingleFlight(account, source = "foreground") {
     const key = account.id;
     const existing = refreshInFlight.get(key);
-    if (existing) return existing;
+    if (existing) {
+      // Foreground requests should not directly inherit idle refresh failures.
+      // Wait for idle maintenance to finish, then re-evaluate token state.
+      if (source === "foreground" && existing.source === "idle") {
+        try {
+          await existing.promise;
+        } catch {
+          // Ignore idle failure here; foreground path handles refresh decisions.
+        }
 
+        if (account.access && account.expires && account.expires > Date.now()) {
+          return account.access;
+        }
+      } else {
+        return existing.promise;
+      }
+    }
+
+    /** @type {{ promise: Promise<string>, source: "foreground" | "idle" }} */
+    const entry = { source, promise: Promise.resolve("") };
     const p = (async () => {
       try {
         return await refreshAccountToken(account, client);
       } finally {
-        if (refreshInFlight.get(key) === p) {
+        if (refreshInFlight.get(key) === entry) {
           refreshInFlight.delete(key);
         }
       }
     })();
 
-    refreshInFlight.set(key, p);
+    entry.promise = p;
+    refreshInFlight.set(key, entry);
     return p;
+  }
+
+  /**
+   * Refresh one idle (non-active) account in the background.
+   * Best-effort only: never disables accounts from background maintenance.
+   * @param {import('./lib/accounts.mjs').ManagedAccount} account
+   * @returns {Promise<void>}
+   */
+  async function refreshIdleAccount(account) {
+    if (!accountManager) return;
+    if (idleRefreshInFlight.has(account.id)) return;
+
+    idleRefreshInFlight.add(account.id);
+    const attemptedRefreshToken = account.refreshToken;
+
+    try {
+      try {
+        await refreshAccountTokenSingleFlight(account, "idle");
+        accountManager.requestSaveToDisk();
+        return;
+      } catch (err) {
+        let details = parseRefreshFailure(err);
+
+        if (!(details.isInvalidGrant || details.isTerminalStatus)) {
+          debugLog("idle refresh skipped after transient failure", {
+            accountIndex: account.index,
+            status: details.status,
+            errorCode: details.errorCode,
+            message: details.message,
+          });
+          return;
+        }
+
+        const retryToken = await readDiskRefreshToken(account.id);
+        if (retryToken && retryToken !== attemptedRefreshToken && account.refreshToken === attemptedRefreshToken) {
+          account.refreshToken = retryToken;
+        }
+
+        try {
+          await refreshAccountTokenSingleFlight(account, "idle");
+          accountManager.requestSaveToDisk();
+          return;
+        } catch (retryErr) {
+          details = parseRefreshFailure(retryErr);
+          debugLog("idle refresh retry failed", {
+            accountIndex: account.index,
+            status: details.status,
+            errorCode: details.errorCode,
+            message: details.message,
+          });
+          return;
+        }
+      }
+    } finally {
+      idleRefreshInFlight.delete(account.id);
+    }
+  }
+
+  /**
+   * Opportunistically refresh one near-expiry idle account in background.
+   * Runs during normal requests so inactive accounts stay healthy.
+   * @param {import('./lib/accounts.mjs').ManagedAccount} activeAccount
+   */
+  function maybeRefreshIdleAccounts(activeAccount) {
+    if (!IDLE_REFRESH_ENABLED || !accountManager) return;
+
+    const now = Date.now();
+    const excluded = new Set([activeAccount.index]);
+    const candidates = accountManager
+      .getEnabledAccounts(excluded)
+      .filter((acc) => !acc.expires || acc.expires <= now + IDLE_REFRESH_WINDOW_MS)
+      .filter((acc) => {
+        const last = idleRefreshLastAttempt.get(acc.id) ?? 0;
+        return now - last >= IDLE_REFRESH_MIN_INTERVAL_MS;
+      })
+      .sort((a, b) => (a.expires ?? 0) - (b.expires ?? 0));
+
+    const target = candidates[0];
+    if (!target) return;
+
+    idleRefreshLastAttempt.set(target.id, now);
+    void refreshIdleAccount(target);
   }
 
   return {
@@ -1344,29 +1475,6 @@ export async function AnthropicAuthPlugin({ client }) {
                     // Persist updated tokens (especially if refresh token rotated)
                     accountManager.requestSaveToDisk();
                   } catch (err) {
-                    /**
-                     * @param {unknown} refreshError
-                     */
-                    const parseRefreshFailure = (refreshError) => {
-                      const message = refreshError instanceof Error ? refreshError.message : String(refreshError);
-                      const status =
-                        typeof refreshError === "object" && refreshError && "status" in refreshError
-                          ? Number(refreshError.status)
-                          : NaN;
-                      const errorCode =
-                        typeof refreshError === "object" &&
-                        refreshError &&
-                        ("errorCode" in refreshError || "code" in refreshError)
-                          ? String(refreshError.errorCode || refreshError.code || "")
-                          : "";
-                      const isInvalidGrant =
-                        errorCode === "invalid_grant" ||
-                        errorCode === "invalid_request" ||
-                        message.includes("invalid_grant");
-                      const isTerminalStatus = status === 400 || status === 401 || status === 403;
-                      return { message, status, errorCode, isInvalidGrant, isTerminalStatus };
-                    };
-
                     // Token refresh failed — check if another instance rotated the
                     // refresh token and persisted it between attempts.
                     let finalError = err;
@@ -1437,6 +1545,9 @@ export async function AnthropicAuthPlugin({ client }) {
                 } else {
                   accessToken = account.access;
                 }
+
+                // Keep non-active accounts warm without blocking the request.
+                maybeRefreshIdleAccounts(account);
 
                 // Build headers with the selected account's token
                 const requestHeaders = buildRequestHeaders(input, requestInit, accessToken, config.headers, modelName);
