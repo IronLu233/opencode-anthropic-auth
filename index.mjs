@@ -398,7 +398,7 @@ function getMidStreamAccountError(parsed) {
  * @returns {string}
  */
 function stripMcpPrefixFromSSE(text) {
-  return text.replace(/^data: (.+)$/gm, (_match, jsonStr) => {
+  return text.replace(/^data:\s*(.+)$/gm, (_match, jsonStr) => {
     try {
       const parsed = JSON.parse(jsonStr);
       if (stripMcpPrefixFromParsedEvent(parsed)) {
@@ -475,10 +475,12 @@ function transformResponse(response, onUsage, onAccountError) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
+  const EMPTY_CHUNK = new Uint8Array();
 
   /** @type {UsageStats} */
   const stats = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
   let sseBuffer = "";
+  let sseRewriteBuffer = "";
   let accountErrorHandled = false;
 
   /**
@@ -528,11 +530,40 @@ function transformResponse(response, onUsage, onAccountError) {
     }
   }
 
+  /**
+   * Rewrite complete SSE lines while preserving chunk boundaries for streaming.
+   * Buffers trailing partial lines to avoid parsing split JSON payloads.
+   * @param {string} chunk
+   * @param {boolean} [flush]
+   * @returns {string}
+   */
+  function rewriteSSEChunk(chunk, flush = false) {
+    sseRewriteBuffer += chunk;
+
+    if (!flush) {
+      const boundary = sseRewriteBuffer.lastIndexOf("\n");
+      if (boundary === -1) return "";
+      const complete = sseRewriteBuffer.slice(0, boundary + 1);
+      sseRewriteBuffer = sseRewriteBuffer.slice(boundary + 1);
+      return stripMcpPrefixFromSSE(complete);
+    }
+
+    if (!sseRewriteBuffer) return "";
+    const finalText = stripMcpPrefixFromSSE(sseRewriteBuffer);
+    sseRewriteBuffer = "";
+    return finalText;
+  }
+
   const stream = new ReadableStream({
     async pull(controller) {
       const { done, value } = await reader.read();
       if (done) {
         processSSEBuffer(true);
+
+        const rewrittenTail = rewriteSSEChunk("", true);
+        if (rewrittenTail) {
+          controller.enqueue(encoder.encode(rewrittenTail));
+        }
 
         if (
           onUsage &&
@@ -544,7 +575,7 @@ function transformResponse(response, onUsage, onAccountError) {
         return;
       }
 
-      let text = decoder.decode(value, { stream: true });
+      const text = decoder.decode(value, { stream: true });
 
       if (onUsage || onAccountError) {
         // Normalize CRLF for parser only; preserve original bytes for passthrough.
@@ -552,8 +583,14 @@ function transformResponse(response, onUsage, onAccountError) {
         processSSEBuffer(false);
       }
 
-      text = stripMcpPrefixFromSSE(text);
-      controller.enqueue(encoder.encode(text));
+      const rewrittenText = rewriteSSEChunk(text, false);
+      if (rewrittenText) {
+        controller.enqueue(encoder.encode(rewrittenText));
+      } else {
+        // Keep the pull/read loop progressing when this chunk only extends a
+        // partial line buffered for later rewrite.
+        controller.enqueue(EMPTY_CHUNK);
+      }
     },
   });
 
@@ -680,23 +717,12 @@ async function readDiskRefreshToken(accountId) {
 /**
  * Refresh an account's access token.
  *
- * Before refreshing, reads the latest refresh token from disk in case
- * another concurrent instance has already rotated it. This prevents
- * `invalid_grant` errors caused by using a stale (pre-rotation) token.
- *
  * @param {import('./lib/accounts.mjs').ManagedAccount} account
  * @param {ReturnType<typeof import('@opencode-ai/plugin').createOpencodeClient>} client
  * @returns {Promise<string>} The new access token
  * @throws {Error} If refresh fails
  */
 async function refreshAccountToken(account, client) {
-  // Read the latest refresh token from disk — another instance may have
-  // rotated it since we loaded into memory.
-  const diskToken = await readDiskRefreshToken(account.id);
-  if (diskToken && diskToken !== account.refreshToken) {
-    account.refreshToken = diskToken;
-  }
-
   const json = await refreshToken(account.refreshToken, { signal: AbortSignal.timeout(10_000) });
 
   account.access = json.access_token;
@@ -705,16 +731,22 @@ async function refreshAccountToken(account, client) {
     account.refreshToken = json.refresh_token;
   }
 
-  // Also persist to OpenCode's auth.json for compatibility
-  await client.auth.set({
-    path: { id: "anthropic" },
-    body: {
-      type: "oauth",
-      refresh: account.refreshToken,
-      access: account.access,
-      expires: account.expires,
-    },
-  });
+  // Also persist to OpenCode's auth.json for compatibility.
+  // This should be best-effort: a persistence hiccup should not invalidate an
+  // otherwise successful refresh token exchange.
+  try {
+    await client.auth.set({
+      path: { id: "anthropic" },
+      body: {
+        type: "oauth",
+        refresh: account.refreshToken,
+        access: account.access,
+        expires: account.expires,
+      },
+    });
+  } catch {
+    // Ignore persistence errors; in-memory tokens remain valid for this request.
+  }
 
   return json.access_token;
 }
@@ -1306,74 +1338,99 @@ export async function AnthropicAuthPlugin({ client }) {
                 let accessToken;
                 // Per-account token refresh
                 if (!account.access || !account.expires || account.expires < Date.now()) {
+                  const attemptedRefreshToken = account.refreshToken;
                   try {
                     accessToken = await refreshAccountTokenSingleFlight(account);
                     // Persist updated tokens (especially if refresh token rotated)
                     accountManager.requestSaveToDisk();
                   } catch (err) {
-                    // Token refresh failed — check if another instance rotated the
-                    // refresh token between our disk-read and the refresh call.
-                    const msg = err instanceof Error ? err.message : String(err);
-                    const status = typeof err === "object" && err && "status" in err ? Number(err.status) : NaN;
-                    const errorCode =
-                      typeof err === "object" && err && ("errorCode" in err || "code" in err)
-                        ? String(err.errorCode || err.code || "")
-                        : "";
-                    const isInvalidGrant =
-                      errorCode === "invalid_grant" || errorCode === "invalid_request" || msg.includes("invalid_grant");
-                    const isTerminalStatus = status === 400 || status === 401 || status === 403;
+                    /**
+                     * @param {unknown} refreshError
+                     */
+                    const parseRefreshFailure = (refreshError) => {
+                      const message = refreshError instanceof Error ? refreshError.message : String(refreshError);
+                      const status =
+                        typeof refreshError === "object" && refreshError && "status" in refreshError
+                          ? Number(refreshError.status)
+                          : NaN;
+                      const errorCode =
+                        typeof refreshError === "object" &&
+                        refreshError &&
+                        ("errorCode" in refreshError || "code" in refreshError)
+                          ? String(refreshError.errorCode || refreshError.code || "")
+                          : "";
+                      const isInvalidGrant =
+                        errorCode === "invalid_grant" ||
+                        errorCode === "invalid_request" ||
+                        message.includes("invalid_grant");
+                      const isTerminalStatus = status === 400 || status === 401 || status === 403;
+                      return { message, status, errorCode, isInvalidGrant, isTerminalStatus };
+                    };
 
-                    // Retry once: re-read the disk token in case another instance
-                    // rotated it between our initial read and the refresh call.
-                    if (isInvalidGrant || isTerminalStatus) {
+                    // Token refresh failed — check if another instance rotated the
+                    // refresh token and persisted it between attempts.
+                    let finalError = err;
+                    let details = parseRefreshFailure(err);
+
+                    // Belt-and-suspenders retry: on terminal/invalid_grant failures,
+                    // always re-read disk token and retry once before disabling.
+                    if (details.isInvalidGrant || details.isTerminalStatus) {
                       const retryToken = await readDiskRefreshToken(account.id);
-                      if (retryToken && retryToken !== account.refreshToken) {
+                      if (
+                        retryToken &&
+                        retryToken !== attemptedRefreshToken &&
+                        account.refreshToken === attemptedRefreshToken
+                      ) {
                         debugLog("refresh token on disk differs from in-memory, retrying with disk token", {
                           accountIndex: account.index,
                         });
                         account.refreshToken = retryToken;
-                        // Clear the single-flight cache so the retry isn't deduped
-                        refreshInFlight.delete(account.id);
-                        try {
-                          accessToken = await refreshAccountTokenSingleFlight(account);
-                          accountManager.requestSaveToDisk();
-                          // Retry succeeded — fall through to use the token
-                        } catch (retryErr) {
-                          // Retry also failed — fall through to disable logic below
-                          debugLog("retry refresh also failed", {
-                            accountIndex: account.index,
-                            message: retryErr instanceof Error ? retryErr.message : String(retryErr),
-                          });
-                          accessToken = undefined;
-                        }
+                      } else if (retryToken && retryToken !== attemptedRefreshToken) {
+                        debugLog("skipping disk token adoption because in-memory token already changed", {
+                          accountIndex: account.index,
+                        });
+                      }
+
+                      try {
+                        accessToken = await refreshAccountTokenSingleFlight(account);
+                        accountManager.requestSaveToDisk();
+                      } catch (retryErr) {
+                        finalError = retryErr;
+                        details = parseRefreshFailure(retryErr);
+                        debugLog("retry refresh failed", {
+                          accountIndex: account.index,
+                          status: details.status,
+                          errorCode: details.errorCode,
+                          message: details.message,
+                        });
                       }
                     }
 
-                    // If we got a token from the retry, skip the failure handling
-                    if (accessToken) {
-                      // Success via retry — continue to use this account
-                    } else {
+                    if (!accessToken) {
                       accountManager.markFailure(account);
 
-                      if (isInvalidGrant || isTerminalStatus) {
+                      if (details.isInvalidGrant || details.isTerminalStatus) {
                         const name = account.email || `Account ${accountManager.getCurrentIndex() + 1}`;
                         debugLog("disabling account after terminal refresh failure", {
                           accountIndex: account.index,
-                          status,
-                          errorCode,
-                          message: msg,
+                          status: details.status,
+                          errorCode: details.errorCode,
+                          message: details.message,
                         });
                         account.enabled = false;
                         accountManager.requestSaveToDisk();
+                        const statusLabel = Number.isFinite(details.status)
+                          ? `HTTP ${details.status}`
+                          : "unknown status";
                         await toast(
-                          `Disabled ${name} (token refresh failed: ${errorCode || `HTTP ${status}`})`,
+                          `Disabled ${name} (token refresh failed: ${details.errorCode || statusLabel})`,
                           "error",
                         );
                       } else {
                         // Skip this account for the remainder of this request.
                         transientRefreshSkips.add(account.index);
                       }
-                      lastError = err;
+                      lastError = finalError;
                       continue; // Try next account
                     }
                   }
