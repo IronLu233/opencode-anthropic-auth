@@ -6,6 +6,7 @@ import { authorize, exchange, refreshToken } from "./lib/oauth.mjs";
 import { loadConfig } from "./lib/config.mjs";
 import { loadAccounts, saveAccounts, clearAccounts, createDefaultStats } from "./lib/storage.mjs";
 import { applyOAuthCredentials, resetAccountTracking } from "./lib/account-state.mjs";
+import { acquireRefreshLock, releaseRefreshLock } from "./lib/refresh-lock.mjs";
 import { resolveSlashCommandName, isDestructiveCommand, isInteractiveOnlyCommand } from "./lib/commands.mjs";
 import { isAccountSpecificError, parseRateLimitReason, parseRetryAfterHeader } from "./lib/backoff.mjs";
 import { getHeaderProfile, getDefaultBetas, getBillingHeaderBlock } from "./lib/request-headers.mjs";
@@ -698,20 +699,58 @@ function buildNoAvailableAccountReason(accountManager, transientRefreshSkips, la
 // ---------------------------------------------------------------------------
 
 /**
- * Read the latest refresh token for an account from disk.
- * Another instance may have rotated it since we loaded into memory.
+ * Read the latest auth fields for an account from disk.
+ * Another instance may have rotated tokens since we loaded into memory.
  * @param {string} accountId
- * @returns {Promise<string | null>}
+ * @returns {Promise<{refreshToken: string, access?: string, expires?: number, tokenUpdatedAt: number} | null>}
  */
-async function readDiskRefreshToken(accountId) {
+async function readDiskAccountAuth(accountId) {
   try {
     const diskData = await loadAccounts();
     if (!diskData) return null;
     const diskAccount = diskData.accounts.find((a) => a.id === accountId);
-    return diskAccount?.refreshToken || null;
+    if (!diskAccount) return null;
+    return {
+      refreshToken: diskAccount.refreshToken,
+      access: diskAccount.access,
+      expires: diskAccount.expires,
+      tokenUpdatedAt: diskAccount.token_updated_at,
+    };
   } catch {
     return null;
   }
+}
+
+/**
+ * @param {import('./lib/accounts.mjs').ManagedAccount} account
+ * @param {number} [now]
+ */
+function markTokenStateUpdated(account, now = Date.now()) {
+  account.tokenUpdatedAt = now;
+}
+
+/**
+ * Adopt disk auth fields only when disk has fresher token state.
+ * @param {import('./lib/accounts.mjs').ManagedAccount} account
+ * @param {{refreshToken: string, access?: string, expires?: number, tokenUpdatedAt: number} | null} diskAuth
+ * @param {{ allowExpiredFallback?: boolean }} [options]
+ * @returns {boolean}
+ */
+function applyDiskAuthIfFresher(account, diskAuth, options = {}) {
+  if (!diskAuth) return false;
+  const diskTokenUpdatedAt = diskAuth.tokenUpdatedAt || 0;
+  const memTokenUpdatedAt = account.tokenUpdatedAt || 0;
+  const diskHasDifferentAuth = diskAuth.refreshToken !== account.refreshToken || diskAuth.access !== account.access;
+  const memAuthExpired = !account.expires || account.expires <= Date.now();
+  const allowExpiredFallback = options.allowExpiredFallback === true;
+  if (diskTokenUpdatedAt <= memTokenUpdatedAt && !(allowExpiredFallback && diskHasDifferentAuth && memAuthExpired)) {
+    return false;
+  }
+  account.refreshToken = diskAuth.refreshToken;
+  account.access = diskAuth.access;
+  account.expires = diskAuth.expires;
+  account.tokenUpdatedAt = Math.max(memTokenUpdatedAt, diskTokenUpdatedAt);
+  return true;
 }
 
 /**
@@ -719,36 +758,72 @@ async function readDiskRefreshToken(accountId) {
  *
  * @param {import('./lib/accounts.mjs').ManagedAccount} account
  * @param {ReturnType<typeof import('@opencode-ai/plugin').createOpencodeClient>} client
+ * @param {"foreground" | "idle"} [source]
  * @returns {Promise<string>} The new access token
  * @throws {Error} If refresh fails
  */
-async function refreshAccountToken(account, client) {
-  const json = await refreshToken(account.refreshToken, { signal: AbortSignal.timeout(10_000) });
+async function refreshAccountToken(account, client, source = "foreground") {
+  const lockResult = await acquireRefreshLock(account.id, {
+    timeoutMs: 2_000,
+    backoffMs: 60,
+    staleMs: 20_000,
+  });
+  const lock =
+    lockResult && typeof lockResult === "object"
+      ? lockResult
+      : {
+          acquired: true,
+          lockPath: null,
+          owner: null,
+          lockInode: null,
+        };
 
-  account.access = json.access_token;
-  account.expires = Date.now() + json.expires_in * 1000;
-  if (json.refresh_token) {
-    account.refreshToken = json.refresh_token;
+  if (!lock.acquired) {
+    const diskAuth = await readDiskAccountAuth(account.id);
+    const adopted = applyDiskAuthIfFresher(account, diskAuth, { allowExpiredFallback: true });
+    if (adopted && account.access && account.expires && account.expires > Date.now()) {
+      return account.access;
+    }
+    throw new Error("Refresh lock busy");
   }
 
-  // Also persist to OpenCode's auth.json for compatibility.
-  // This should be best-effort: a persistence hiccup should not invalidate an
-  // otherwise successful refresh token exchange.
   try {
-    await client.auth.set({
-      path: { id: "anthropic" },
-      body: {
-        type: "oauth",
-        refresh: account.refreshToken,
-        access: account.access,
-        expires: account.expires,
-      },
-    });
-  } catch {
-    // Ignore persistence errors; in-memory tokens remain valid for this request.
-  }
+    const diskAuthBeforeRefresh = await readDiskAccountAuth(account.id);
+    const adopted = applyDiskAuthIfFresher(account, diskAuthBeforeRefresh);
+    if (source === "foreground" && adopted && account.access && account.expires && account.expires > Date.now()) {
+      return account.access;
+    }
 
-  return json.access_token;
+    const json = await refreshToken(account.refreshToken, { signal: AbortSignal.timeout(10_000) });
+
+    account.access = json.access_token;
+    account.expires = Date.now() + json.expires_in * 1000;
+    if (json.refresh_token) {
+      account.refreshToken = json.refresh_token;
+    }
+    markTokenStateUpdated(account);
+
+    // Also persist to OpenCode's auth.json for compatibility.
+    // This should be best-effort: a persistence hiccup should not invalidate an
+    // otherwise successful refresh token exchange.
+    try {
+      await client.auth.set({
+        path: { id: "anthropic" },
+        body: {
+          type: "oauth",
+          refresh: account.refreshToken,
+          access: account.access,
+          expires: account.expires,
+        },
+      });
+    } catch {
+      // Ignore persistence errors; in-memory tokens remain valid for this request.
+    }
+
+    return json.access_token;
+  } finally {
+    await releaseRefreshLock(lock);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -989,6 +1064,7 @@ export async function AnthropicAuthPlugin({ client }) {
         refreshToken: credentials.refresh,
         access: credentials.access,
         expires: credentials.expires,
+        token_updated_at: now,
         addedAt: now,
         lastUsed: 0,
         enabled: true,
@@ -1229,7 +1305,7 @@ export async function AnthropicAuthPlugin({ client }) {
     const entry = { source, promise: Promise.resolve("") };
     const p = (async () => {
       try {
-        return await refreshAccountToken(account, client);
+        return await refreshAccountToken(account, client, source);
       } finally {
         if (refreshInFlight.get(key) === entry) {
           refreshInFlight.delete(key);
@@ -1273,9 +1349,15 @@ export async function AnthropicAuthPlugin({ client }) {
           return;
         }
 
-        const retryToken = await readDiskRefreshToken(account.id);
+        const diskAuth = await readDiskAccountAuth(account.id);
+        const retryToken = diskAuth?.refreshToken;
         if (retryToken && retryToken !== attemptedRefreshToken && account.refreshToken === attemptedRefreshToken) {
           account.refreshToken = retryToken;
+          if (diskAuth?.tokenUpdatedAt) {
+            account.tokenUpdatedAt = diskAuth.tokenUpdatedAt;
+          } else {
+            markTokenStateUpdated(account);
+          }
         }
 
         try {
@@ -1483,7 +1565,8 @@ export async function AnthropicAuthPlugin({ client }) {
                     // Belt-and-suspenders retry: on terminal/invalid_grant failures,
                     // always re-read disk token and retry once before disabling.
                     if (details.isInvalidGrant || details.isTerminalStatus) {
-                      const retryToken = await readDiskRefreshToken(account.id);
+                      const diskAuth = await readDiskAccountAuth(account.id);
+                      const retryToken = diskAuth?.refreshToken;
                       if (
                         retryToken &&
                         retryToken !== attemptedRefreshToken &&
@@ -1493,6 +1576,11 @@ export async function AnthropicAuthPlugin({ client }) {
                           accountIndex: account.index,
                         });
                         account.refreshToken = retryToken;
+                        if (diskAuth?.tokenUpdatedAt) {
+                          account.tokenUpdatedAt = diskAuth.tokenUpdatedAt;
+                        } else {
+                          markTokenStateUpdated(account);
+                        }
                       } else if (retryToken && retryToken !== attemptedRefreshToken) {
                         debugLog("skipping disk token adoption because in-memory token already changed", {
                           accountIndex: account.index,
@@ -1596,6 +1684,7 @@ export async function AnthropicAuthPlugin({ client }) {
                     if (reason === "AUTH_FAILED") {
                       account.access = undefined;
                       account.expires = undefined;
+                      markTokenStateUpdated(account);
                     }
 
                     debugLog("account-specific error, switching account", {
@@ -1648,6 +1737,7 @@ export async function AnthropicAuthPlugin({ client }) {
                       if (details.invalidateToken) {
                         account.access = undefined;
                         account.expires = undefined;
+                        markTokenStateUpdated(account);
                       }
                       accountManager.markRateLimited(account, details.reason, null);
                     }

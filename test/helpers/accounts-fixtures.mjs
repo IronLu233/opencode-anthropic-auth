@@ -11,10 +11,12 @@ export function makeStoredAccount(overrides = {}, options = {}) {
   const index = options.index ?? 0;
   const tokenFactory = options.tokenFactory || ((i) => `refresh-${i + 1}`);
   const addedAtFactory = options.addedAtFactory || ((i) => (i + 1) * 1000);
+  const addedAt = addedAtFactory(index);
 
   return {
     refreshToken: tokenFactory(index),
-    addedAt: addedAtFactory(index),
+    token_updated_at: addedAt,
+    addedAt,
     lastUsed: 0,
     enabled: true,
     rateLimitResetTimes: {},
