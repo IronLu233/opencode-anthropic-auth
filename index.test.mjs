@@ -63,7 +63,7 @@ vi.stubGlobal("fetch", mockFetch);
 
 import { AnthropicAuthPlugin } from "./index.mjs";
 import { saveAccounts, loadAccounts, clearAccounts } from "./lib/storage.mjs";
-import { acquireRefreshLock } from "./lib/refresh-lock.mjs";
+import { acquireRefreshLock, releaseRefreshLock } from "./lib/refresh-lock.mjs";
 import { loadConfig, DEFAULT_CONFIG } from "./lib/config.mjs";
 import { makeAccountsData as makeFixtureAccountsData } from "./test/helpers/accounts-fixtures.mjs";
 
@@ -1628,6 +1628,65 @@ describe("fetch interceptor — token refresh", () => {
     const secondRefreshBody = new URLSearchParams(refreshCalls[1][1].body);
     expect(firstRefreshBody.get("refresh_token")).toBe(oldToken);
     expect(secondRefreshBody.get("refresh_token")).toBe(rotatedToken);
+  });
+
+  it("persists new tokens to disk before releasing the refresh lock", async () => {
+    // This is the critical race-prevention test.  Previously, refreshAccountToken
+    // released the lock, then the caller scheduled a debounced save (~1 s later).
+    // A second process could acquire the lock and read the stale (rotated-away)
+    // refresh token from disk, causing an invalid_grant cascade.
+    const accountId = "stable-id-1";
+    const oldToken = "pre-rotation-refresh";
+
+    loadAccounts.mockResolvedValue(makeAccountsData([{ id: accountId, refreshToken: oldToken }]));
+    saveAccounts.mockResolvedValue(undefined);
+
+    const plugin = await AnthropicAuthPlugin({ client });
+    const getAuth = vi.fn().mockResolvedValue({
+      type: "oauth",
+      refresh: oldToken,
+      access: "expired-access",
+      expires: Date.now() - 1000,
+    });
+    const result = await plugin.auth.loader(getAuth, makeProvider());
+
+    // Disk reads during request: syncActiveIndexFromDisk
+    loadAccounts.mockResolvedValue(makeAccountsData([{ id: accountId, refreshToken: oldToken }]));
+
+    // Token refresh succeeds — returns a rotated refresh token
+    mockFetch.mockResolvedValueOnce(mockTokenRefresh("new-access", "rotated-refresh"));
+    // API call succeeds
+    mockFetch.mockResolvedValueOnce(new Response('{"content":[]}', { status: 200 }));
+
+    // Track call ordering between saveAccounts and releaseRefreshLock
+    const callOrder = [];
+    saveAccounts.mockImplementation(async () => {
+      callOrder.push("save");
+    });
+    releaseRefreshLock.mockImplementation(async () => {
+      callOrder.push("unlock");
+    });
+
+    const response = await result.fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({ messages: [] }),
+    });
+
+    expect(response.status).toBe(200);
+
+    // The save that contains the rotated token must happen before the lock
+    // is released so other processes see it on disk immediately.
+    const saveIdx = callOrder.indexOf("save");
+    const unlockIdx = callOrder.indexOf("unlock");
+    expect(saveIdx).toBeGreaterThanOrEqual(0);
+    expect(unlockIdx).toBeGreaterThanOrEqual(0);
+    expect(saveIdx).toBeLessThan(unlockIdx);
+
+    // Verify the saved data contains the rotated token
+    const savedData = saveAccounts.mock.calls.find(
+      (call) => call[0]?.accounts?.[0]?.refreshToken === "rotated-refresh",
+    );
+    expect(savedData).toBeTruthy();
   });
 
   it("still disables account when retry also fails", async () => {
