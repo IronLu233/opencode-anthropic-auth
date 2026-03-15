@@ -309,12 +309,12 @@ Configuration is stored at `~/.config/opencode/anthropic-auth.json`. All setting
 
   // Outbound request header emulation (Claude Code spoof profile)
   "headers": {
-    // Available: "claude-cli-2.1.50", "claude-cli-default"
-    "emulation_profile": "claude-cli-2.1.50",
+    // Available: "claude-cli-default" (= "claude-cli-2.1.75"), "claude-cli-2.1.75", "claude-cli-2.1.50"
+    "emulation_profile": "claude-cli-default",
 
     // Override any default spoofed header
     "overrides": {
-      // "user-agent": "claude-cli/2.1.50 (external, cli)"
+      // "user-agent": "claude-cli/2.1.75 (external, cli)"
       // "anthropic-beta": "custom-beta-a,custom-beta-b"
     },
 
@@ -335,19 +335,23 @@ Header override behavior:
 
 ### Default Emulation Profile
 
-The default profile (`claude-cli-2.1.50`, alias `claude-cli-default`) sends pinned Claude Code-style headers, including:
+The default profile is `claude-cli-2.1.75`. The `claude-cli-default` alias points to the same captured Opus-style request profile, while `claude-cli-2.1.50` remains available as a legacy pinned profile.
+
+`claude-cli-2.1.75` sends pinned Claude Code-style headers, including:
 
 - `accept: application/json`
 - `anthropic-version: 2023-06-01`
 - `anthropic-dangerous-direct-browser-access: true`
-- `user-agent: claude-cli/2.1.50 (external, cli)`
+- `user-agent: claude-cli/2.1.75 (external, cli)`
 - `x-app: cli`
 - `x-stainless-*` metadata headers (pinned values)
 
 `anthropic-beta` defaults are model-aware:
 
-- Sonnet baseline: `claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05,effort-2025-11-24,adaptive-thinking-2026-01-28`
+- Baseline: `claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24`
 - Opus adds: `context-management-2025-06-27`
+
+The billing header stays optional and off by default.
 
 Transport-managed headers (such as `host`, `content-length`, `connection`, `accept-encoding`) are intentionally left to the HTTP runtime.
 

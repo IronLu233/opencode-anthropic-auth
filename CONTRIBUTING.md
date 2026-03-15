@@ -224,13 +224,13 @@ flowchart LR
 
 ### Header Transformations
 
-| Step             | What                                                                                                  | Why                                    |
-| ---------------- | ----------------------------------------------------------------------------------------------------- | -------------------------------------- |
-| Authorization    | `Bearer <access_token>`                                                                               | OAuth authentication                   |
-| Header profile   | Pinned Claude CLI profile (`claude-cli-2.1.50`) including `x-app` + `x-stainless-*`                   | Spoof separate Claude CLI client       |
-| Beta headers     | Profile defaults (+ Opus-specific `context-management-2025-06-27`), merged with incoming custom betas | Required beta features + compatibility |
-| User overrides   | `headers.overrides` (including `anthropic-beta`) then `headers.disable` removal                       | Per-install customization              |
-| Remove x-api-key | Delete if present                                                                                     | OAuth uses Bearer, not API key         |
+| Step             | What                                                                                                                                                                                                                                                                                                                                       | Why                                    |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------- |
+| Authorization    | `Bearer <access_token>`                                                                                                                                                                                                                                                                                                                    | OAuth authentication                   |
+| Header profile   | Default pinned profile `claude-cli-2.1.75` (alias `claude-cli-default`); legacy `claude-cli-2.1.50` remains available                                                                                                                                                                                                                      | Spoof separate Claude CLI client       |
+| Beta headers     | `claude-cli-2.1.75` defaults (`claude-code-20250219`, `oauth-2025-04-20`, `context-1m-2025-08-07`, `interleaved-thinking-2025-05-14`, `redact-thinking-2026-02-12`, `prompt-caching-scope-2026-01-05`, `advanced-tool-use-2025-11-20`, `effort-2025-11-24`) + Opus-only `context-management-2025-06-27`, merged with incoming custom betas | Required beta features + compatibility |
+| User overrides   | `headers.overrides` (including `anthropic-beta`) then `headers.disable` removal                                                                                                                                                                                                                                                            | Per-install customization              |
+| Remove x-api-key | Delete if present                                                                                                                                                                                                                                                                                                                          | OAuth uses Bearer, not API key         |
 
 ### Response Transformations
 

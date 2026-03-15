@@ -571,7 +571,7 @@ describe("fetch interceptor", () => {
     expect(headers.get("accept")).toBe("application/json");
     expect(headers.get("anthropic-version")).toBe("2023-06-01");
     expect(headers.get("anthropic-dangerous-direct-browser-access")).toBe("true");
-    expect(headers.get("user-agent")).toBe("claude-cli/2.1.50 (external, cli)");
+    expect(headers.get("user-agent")).toBe("claude-cli/2.1.75 (external, cli)");
     expect(headers.get("x-app")).toBe("cli");
     expect(headers.get("x-stainless-arch")).toBe("arm64");
     expect(headers.get("x-stainless-lang")).toBe("js");
@@ -583,6 +583,10 @@ describe("fetch interceptor", () => {
     expect(headers.get("x-stainless-timeout")).toBe("600");
     expect(headers.get("anthropic-beta")).toContain("claude-code-20250219");
     expect(headers.get("anthropic-beta")).toContain("oauth-2025-04-20");
+    expect(headers.get("anthropic-beta")).toContain("context-1m-2025-08-07");
+    expect(headers.get("anthropic-beta")).toContain("redact-thinking-2026-02-12");
+    expect(headers.get("anthropic-beta")).toContain("advanced-tool-use-2025-11-20");
+    expect(headers.get("anthropic-beta")).not.toContain("adaptive-thinking-2026-01-28");
     expect(headers.get("anthropic-beta")).not.toContain("context-management-2025-06-27");
     expect(headers.has("x-api-key")).toBe(false);
   });
