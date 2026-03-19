@@ -61,6 +61,10 @@ vi.mock("node:readline/promises", () => ({
   })),
 }));
 
+vi.mock("./lib/opencode-auth.mjs", () => ({
+  syncOpenCodeAuthFromStorage: vi.fn().mockResolvedValue(undefined),
+}));
+
 import {
   formatDuration,
   formatTimeAgo,
@@ -90,6 +94,7 @@ import {
 import { loadAccounts, saveAccounts } from "./lib/storage.mjs";
 import { loadConfig, loadRawConfig, saveConfig as saveConfigMock, DEFAULT_CONFIG } from "./lib/config.mjs";
 import { authorize, exchange, revoke } from "./lib/oauth.mjs";
+import { syncOpenCodeAuthFromStorage } from "./lib/opencode-auth.mjs";
 import { createInterface } from "node:readline/promises";
 import { execFile } from "node:child_process";
 
@@ -733,6 +738,9 @@ describe("cmdSwitch", () => {
 
     // Verify saveAccounts was called with updated activeIndex
     expect(saveAccounts).toHaveBeenCalledWith(expect.objectContaining({ activeIndex: 1 }));
+    expect(syncOpenCodeAuthFromStorage).toHaveBeenCalledWith(expect.objectContaining({ activeIndex: 1 }), {
+      clearIfMissing: true,
+    });
   });
 
   it("rejects invalid account number", async () => {
@@ -882,6 +890,7 @@ describe("auth commands", () => {
     vi.resetAllMocks();
     output = captureOutput();
     saveAccounts.mockResolvedValue(undefined);
+    syncOpenCodeAuthFromStorage.mockResolvedValue(undefined);
     loadAccounts.mockResolvedValue(makeStorage());
     vi.mocked(authorize).mockResolvedValue({ url: "https://auth.example/authorize", verifier: "pkce-verifier" });
     vi.mocked(exchange).mockResolvedValue({
@@ -935,6 +944,13 @@ describe("auth commands", () => {
           ]),
         }),
       );
+      expect(syncOpenCodeAuthFromStorage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          activeIndex: 0,
+          accounts: expect.arrayContaining([expect.objectContaining({ refreshToken: "refresh-new" })]),
+        }),
+        { clearIfMissing: true },
+      );
     } finally {
       restoreTTY();
     }
@@ -968,6 +984,7 @@ describe("auth commands", () => {
       expect(saved.accounts[4].refreshToken).toBe("refresh-new");
       expect(saved.accounts[4].access).toBe("access-new");
       expect(saved.accounts[4].enabled).toBe(true);
+      expect(syncOpenCodeAuthFromStorage).toHaveBeenCalledWith(fullStorage, { clearIfMissing: true });
     } finally {
       restoreTTY();
     }
@@ -1069,6 +1086,10 @@ describe("auth commands", () => {
     expect(code).toBe(0);
     expect(revoke).toHaveBeenCalledTimes(3);
     expect(saveAccounts).toHaveBeenCalledWith({ version: 1, accounts: [], activeIndex: 0 });
+    expect(syncOpenCodeAuthFromStorage).toHaveBeenCalledWith(
+      { version: 1, accounts: [], activeIndex: 0 },
+      { clearIfMissing: true },
+    );
   });
 
   it("cmdReauth refreshes credentials and resets account failure state", async () => {
@@ -1104,6 +1125,7 @@ describe("auth commands", () => {
           rateLimitResetTimes: {},
         }),
       );
+      expect(syncOpenCodeAuthFromStorage).toHaveBeenCalledWith(saved, { clearIfMissing: true });
       expect(output.text()).toContain("re-enabled");
     } finally {
       restoreTTY();
@@ -1135,6 +1157,7 @@ describe("auth commands", () => {
         rateLimitResetTimes: {},
       }),
     );
+    expect(syncOpenCodeAuthFromStorage).toHaveBeenCalledWith(saved, { clearIfMissing: true });
     expect(output.text()).toContain("Token refreshed");
     expect(output.text()).toContain("re-enabled");
   });

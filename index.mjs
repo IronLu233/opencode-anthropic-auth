@@ -10,6 +10,7 @@ import { acquireRefreshLock, releaseRefreshLock } from "./lib/refresh-lock.mjs";
 import { resolveSlashCommandName, isDestructiveCommand, isInteractiveOnlyCommand } from "./lib/commands.mjs";
 import { isAccountSpecificError, parseRateLimitReason, parseRetryAfterHeader } from "./lib/backoff.mjs";
 import { getHeaderProfile, getDefaultBetas, getBillingHeaderBlock } from "./lib/request-headers.mjs";
+import { setOpenCodeAuth, syncOpenCodeAuthFromStorage } from "./lib/opencode-auth.mjs";
 import { stripAnsi } from "./lib/util.mjs";
 
 // ---------------------------------------------------------------------------
@@ -823,21 +824,21 @@ async function refreshAccountToken(account, client, source = "foreground", { onT
       }
     }
 
-    // Also persist to OpenCode's auth.json for compatibility.
-    // This should be best-effort: a persistence hiccup should not invalidate an
+    // Also persist to OpenCode's auth store(s) for compatibility.
+    // This is best-effort: a persistence hiccup should not invalidate an
     // otherwise successful refresh token exchange.
     try {
       await client.auth.set({
         path: { id: "anthropic" },
-        body: {
-          type: "oauth",
-          refresh: account.refreshToken,
-          access: account.access,
-          expires: account.expires,
-        },
+        body: { type: "oauth", refresh: account.refreshToken, access: account.access, expires: account.expires },
       });
     } catch {
-      // Ignore persistence errors; in-memory tokens remain valid for this request.
+      // client.auth.set may fail if the OpenCode IPC channel is unavailable.
+    }
+    try {
+      await setOpenCodeAuth({ refresh: account.refreshToken, access: account.access, expires: account.expires });
+    } catch {
+      // File write may fail transiently; in-memory tokens remain valid.
     }
 
     return json.access_token;
@@ -880,6 +881,17 @@ function parseCommandArgs(raw) {
  */
 export async function AnthropicAuthPlugin({ client }) {
   const config = loadConfig();
+
+  // Hydrate OpenCode's auth.json from existing plugin accounts so that
+  // CLI-only logins are recognized without an in-app Connect Provider flow.
+  // Deliberately omits { clearIfMissing: true } so a first-run with no
+  // accounts does not wipe a pre-existing Anthropic auth entry.
+  const existingStorage = await loadAccounts();
+  try {
+    await syncOpenCodeAuthFromStorage(existingStorage);
+  } catch {
+    // Best-effort; a failure here does not block plugin startup.
+  }
 
   /** @type {AccountManager | null} */
   let accountManager = null;
@@ -937,10 +949,26 @@ export async function AnthropicAuthPlugin({ client }) {
    * @param {number} expires
    */
   async function persistOpenCodeAuth(refresh, access, expires) {
-    await client.auth.set({
-      path: { id: "anthropic" },
-      body: { type: "oauth", refresh, access, expires },
-    });
+    // Try both persistence paths. If client.auth.set fails but the file
+    // write succeeds, we intentionally swallow the client error because
+    // the file is the durable source of truth that OpenCode reads on
+    // startup. The client API is a nice-to-have for immediate in-memory
+    // propagation but is not required for correctness.
+    let clientError = null;
+    try {
+      await client.auth.set({
+        path: { id: "anthropic" },
+        body: { type: "oauth", refresh, access, expires },
+      });
+    } catch (err) {
+      clientError = err;
+    }
+
+    try {
+      await setOpenCodeAuth({ refresh, access, expires });
+    } catch (err) {
+      throw clientError || err;
+    }
   }
 
   /**

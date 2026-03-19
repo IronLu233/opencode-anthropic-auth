@@ -35,6 +35,7 @@ import { loadConfig, loadRawConfig, saveConfig, getConfigPath, VALID_STRATEGIES 
 import { authorize, exchange, revoke, refreshToken } from "./lib/oauth.mjs";
 import { applyOAuthCredentials, resetAccountTracking, adjustActiveIndexAfterRemoval } from "./lib/account-state.mjs";
 import { resolveCliCommandName } from "./lib/commands.mjs";
+import { syncOpenCodeAuthFromStorage } from "./lib/opencode-auth.mjs";
 import { stripAnsi } from "./lib/util.mjs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { pathToFileURL } from "node:url";
@@ -360,6 +361,7 @@ export async function cmdLogin() {
     applyOAuthCredentials(storage.accounts[existingIdx], credentials);
     storage.accounts[existingIdx].enabled = true;
     await saveAccounts(storage);
+    await syncOpenCodeAuthFromStorage(storage, { clearIfMissing: true });
 
     const label = credentials.email || `Account ${existingIdx + 1}`;
     console.log(c.green(`Updated existing account #${existingIdx + 1} (${label}).`));
@@ -391,6 +393,7 @@ export async function cmdLogin() {
 
   // If this is the first account, it's already active at index 0
   await saveAccounts(storage);
+  await syncOpenCodeAuthFromStorage(storage, { clearIfMissing: true });
 
   const label = credentials.email || `Account ${storage.accounts.length}`;
   console.log(c.green(`Added account #${storage.accounts.length} (${label}).`));
@@ -493,6 +496,7 @@ export async function cmdLogout(arg, opts = {}) {
   adjustActiveIndexAfterRemoval(stored, idx);
 
   await saveAccounts(stored);
+  await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true });
   console.log(c.green(`Logged out account #${n} (${label}).`));
 
   if (stored.accounts.length > 0) {
@@ -549,6 +553,7 @@ async function cmdLogoutAll(opts = {}) {
 
   // Write explicit empty state so running plugin instances reconcile immediately.
   await saveAccounts({ version: 1, accounts: [], activeIndex: 0 });
+  await syncOpenCodeAuthFromStorage({ version: 1, accounts: [], activeIndex: 0 }, { clearIfMissing: true });
   console.log(c.green(`Logged out all ${count} account(s).`));
 
   return 0;
@@ -592,6 +597,7 @@ export async function cmdReauth(arg) {
   resetAccountTracking(existing);
 
   await saveAccounts(stored);
+  await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true });
 
   const newLabel = credentials.email || `Account ${n}`;
   console.log(c.green(`Re-authenticated account #${n} (${newLabel}).`));
@@ -638,6 +644,7 @@ export async function cmdRefresh(arg) {
   resetAccountTracking(account);
 
   await saveAccounts(stored);
+  await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true });
 
   const expiresIn = account.expires ? formatDuration(account.expires - Date.now()) : "unknown";
   console.log(c.green(`Token refreshed for account #${n} (${label}).`));
@@ -838,6 +845,7 @@ export async function cmdSwitch(arg) {
 
   stored.activeIndex = idx;
   await saveAccounts(stored);
+  await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true });
 
   const label = stored.accounts[idx].email || `Account ${n}`;
   console.log(c.green(`Switched active account to #${n} (${label}).`));
@@ -919,6 +927,7 @@ export async function cmdDisable(arg) {
   }
 
   await saveAccounts(stored);
+  await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true });
 
   console.log(c.yellow(`Disabled account #${n} (${label}).`));
   if (switchedTo !== null) {
@@ -974,6 +983,7 @@ export async function cmdRemove(arg, opts = {}) {
   adjustActiveIndexAfterRemoval(stored, idx);
 
   await saveAccounts(stored);
+  await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true });
   console.log(c.green(`Removed account #${n} (${label}).`));
 
   if (stored.accounts.length > 0) {

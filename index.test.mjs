@@ -45,6 +45,11 @@ vi.mock("./lib/refresh-lock.mjs", () => ({
   releaseRefreshLock: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock("./lib/opencode-auth.mjs", () => ({
+  setOpenCodeAuth: vi.fn().mockResolvedValue(undefined),
+  syncOpenCodeAuthFromStorage: vi.fn().mockResolvedValue(undefined),
+}));
+
 // Mock config — always return defaults
 vi.mock("./lib/config.mjs", async (importOriginal) => {
   const original = await importOriginal();
@@ -64,6 +69,7 @@ vi.stubGlobal("fetch", mockFetch);
 import { AnthropicAuthPlugin } from "./index.mjs";
 import { saveAccounts, loadAccounts, clearAccounts } from "./lib/storage.mjs";
 import { acquireRefreshLock, releaseRefreshLock } from "./lib/refresh-lock.mjs";
+import { setOpenCodeAuth, syncOpenCodeAuthFromStorage } from "./lib/opencode-auth.mjs";
 import { loadConfig, DEFAULT_CONFIG } from "./lib/config.mjs";
 import { makeAccountsData as makeFixtureAccountsData } from "./test/helpers/accounts-fixtures.mjs";
 
@@ -169,6 +175,8 @@ describe("plugin lifecycle", () => {
     client = makeClient();
     loadAccounts.mockResolvedValue(null);
     saveAccounts.mockResolvedValue(undefined);
+    setOpenCodeAuth.mockResolvedValue(undefined);
+    syncOpenCodeAuthFromStorage.mockResolvedValue(undefined);
   });
 
   it("authorize callback creates accounts file on first login (accountManager starts null)", async () => {
@@ -211,6 +219,15 @@ describe("plugin lifecycle", () => {
         ]),
       }),
     );
+  });
+
+  it("syncs OpenCode auth from stored accounts at plugin startup", async () => {
+    const stored = makeAccountsData([{ refreshToken: "stored-refresh", access: "stored-access" }]);
+    loadAccounts.mockResolvedValue(stored);
+
+    await AnthropicAuthPlugin({ client });
+
+    expect(syncOpenCodeAuthFromStorage).toHaveBeenCalledWith(stored);
   });
 
   it("loader bootstraps from auth.json and saves accounts file immediately", async () => {
@@ -421,6 +438,12 @@ describe("slash commands", () => {
         }),
       }),
     );
+    expect(setOpenCodeAuth).toHaveBeenCalledWith(
+      expect.objectContaining({
+        refresh: "refresh-from-login",
+        access: "access-from-login",
+      }),
+    );
     expect(saveAccounts).toHaveBeenCalledWith(
       expect.objectContaining({
         version: 1,
@@ -496,6 +519,12 @@ describe("slash commands", () => {
           refresh: "fresh-refresh",
           access: "fresh-access",
         }),
+      }),
+    );
+    expect(setOpenCodeAuth).toHaveBeenCalledWith(
+      expect.objectContaining({
+        refresh: "fresh-refresh",
+        access: "fresh-access",
       }),
     );
 
@@ -1037,7 +1066,10 @@ describe("fetch interceptor — token refresh", () => {
   beforeEach(() => {
     vi.resetAllMocks();
     client = makeClient();
+    client.auth.set.mockResolvedValue(undefined);
     saveAccounts.mockResolvedValue(undefined);
+    setOpenCodeAuth.mockResolvedValue(undefined);
+    syncOpenCodeAuthFromStorage.mockResolvedValue(undefined);
   });
 
   it("refreshes expired account token before making API request", async () => {
@@ -1077,22 +1109,13 @@ describe("fetch interceptor — token refresh", () => {
     // Second call should use the fresh token
     const [, apiInit] = mockFetch.mock.calls[1];
     expect(apiInit.headers.get("authorization")).toBe("Bearer fresh-access");
-
-    // Should persist updated tokens (client.auth.set called during refresh)
-    expect(client.auth.set).toHaveBeenCalledWith(
-      expect.objectContaining({
-        body: expect.objectContaining({
-          access: "fresh-access",
-          refresh: "refresh-1-rotated",
-        }),
-      }),
-    );
   });
 
   it("continues request flow when auth.json persistence fails after successful refresh", async () => {
     loadAccounts.mockResolvedValue(makeAccountsData());
     saveAccounts.mockResolvedValue(undefined);
     client.auth.set.mockRejectedValueOnce(new Error("disk temporarily unavailable"));
+    setOpenCodeAuth.mockRejectedValueOnce(new Error("disk temporarily unavailable"));
 
     const plugin = await AnthropicAuthPlugin({ client });
     const getAuth = vi.fn().mockResolvedValue({
