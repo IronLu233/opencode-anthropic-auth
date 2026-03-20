@@ -12,12 +12,21 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 vi.mock("./lib/storage.mjs", async (importOriginal) => {
   const original = await importOriginal();
+  const loadAccounts = vi.fn().mockResolvedValue(null);
+  const saveAccounts = vi.fn().mockResolvedValue(undefined);
+  const clearAccounts = vi.fn().mockResolvedValue(undefined);
+  const saveAndSync = vi.fn(async (stored, options = {}) => {
+    await saveAccounts(stored);
+    const { syncOpenCodeAuthFromStorage } = await import("./lib/opencode-auth.mjs");
+    await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true, ...options });
+  });
   return {
     ...original,
     hasAccountsStorageFile: vi.fn(() => false),
-    loadAccounts: vi.fn().mockResolvedValue(null),
-    saveAccounts: vi.fn().mockResolvedValue(undefined),
-    clearAccounts: vi.fn().mockResolvedValue(undefined),
+    loadAccounts,
+    saveAccounts,
+    saveAndSync,
+    clearAccounts,
     getStoragePath: vi.fn(() => "/home/user/.config/opencode/anthropic-accounts.json"),
   };
 });
@@ -66,6 +75,28 @@ vi.mock("./lib/opencode-auth.mjs", () => ({
   syncOpenCodeAuthFromStorage: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock("./lib/refresh-lock.mjs", () => ({
+  acquireRefreshLock: vi.fn().mockResolvedValue({ acquired: true, lockPath: "/tmp/opencode-test.lock", owner: "test" }),
+  releaseRefreshLock: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock("./lib/token-refresh.mjs", () => ({
+  refreshAccountToken: vi.fn(async (account, _client, _source, options = {}) => {
+    const resp = await fetch("https://console.anthropic.com/v1/oauth/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    });
+    if (!resp.ok) throw new Error("refresh failed");
+    const json = await resp.json();
+    account.access = json.access_token;
+    account.expires = Date.now() + json.expires_in * 1000;
+    if (json.refresh_token) account.refreshToken = json.refresh_token;
+    account.tokenUpdatedAt = Date.now();
+    if (options?.onTokensUpdated) await options.onTokensUpdated();
+    return json.access_token;
+  }),
+}));
+
 import {
   formatDuration,
   formatTimeAgo,
@@ -96,6 +127,7 @@ import { loadAccounts, saveAccounts } from "./lib/storage.mjs";
 import { loadConfig, loadRawConfig, saveConfig as saveConfigMock, DEFAULT_CONFIG } from "./lib/config.mjs";
 import { authorize, exchange, revoke } from "./lib/oauth.mjs";
 import { syncOpenCodeAuthFromStorage } from "./lib/opencode-auth.mjs";
+import { acquireRefreshLock, releaseRefreshLock } from "./lib/refresh-lock.mjs";
 import { createInterface } from "node:readline/promises";
 import { execFile } from "node:child_process";
 
@@ -105,8 +137,15 @@ import { execFile } from "node:child_process";
 const mockFetch = vi.fn();
 vi.stubGlobal("fetch", mockFetch);
 
+function restoreDefaultMocks() {
+  acquireRefreshLock.mockResolvedValue({ acquired: true, lockPath: "/tmp/opencode-test.lock", owner: "test" });
+  releaseRefreshLock.mockResolvedValue(undefined);
+  syncOpenCodeAuthFromStorage.mockResolvedValue(undefined);
+}
+
 beforeEach(() => {
   mockFetch.mockReset();
+  restoreDefaultMocks();
   // Default: all fetches fail gracefully (usage endpoints return null)
   mockFetch.mockResolvedValue({ ok: false, status: 500, text: async () => "" });
 });
@@ -515,6 +554,7 @@ describe("cmdList", () => {
 
   beforeEach(() => {
     vi.resetAllMocks();
+    restoreDefaultMocks();
     saveAccounts.mockResolvedValue(undefined);
     output = captureOutput();
   });

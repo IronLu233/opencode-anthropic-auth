@@ -15,7 +15,7 @@ export function makeStoredAccount(overrides = {}, options = {}) {
 
   return {
     refreshToken: tokenFactory(index),
-    token_updated_at: addedAt,
+    tokenUpdatedAt: addedAt,
     addedAt,
     lastUsed: 0,
     enabled: true,

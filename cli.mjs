@@ -33,22 +33,23 @@
 import {
   loadAccounts,
   saveAccounts,
+  saveAndSync,
   getStoragePath,
   createDefaultStats,
   hasAccountsStorageFile,
 } from "./lib/storage.mjs";
 import { loadConfig, loadRawConfig, saveConfig, getConfigPath, VALID_STRATEGIES } from "./lib/config.mjs";
-import { authorize, exchange, revoke, refreshToken } from "./lib/oauth.mjs";
+import { authorize, exchange, revoke } from "./lib/oauth.mjs";
 import {
   applyLoginCredentials,
   applyReauthCredentials,
-  applyOAuthCredentials,
   adjustActiveIndexAfterRemoval,
   ensureAccountStorage,
   resetAccountTracking,
 } from "./lib/account-state.mjs";
 import { resolveCliCommandName } from "./lib/commands.mjs";
-import { syncOpenCodeAuthFromStorage } from "./lib/opencode-auth.mjs";
+import { refreshAccountToken } from "./lib/token-refresh.mjs";
+
 import { stripAnsi } from "./lib/util.mjs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { pathToFileURL } from "node:url";
@@ -151,20 +152,19 @@ function rpad(str, width) {
 /**
  * Refresh an account's OAuth access token.
  * Mutates the account object in-place (sets `refreshToken`, `access`,
- * `expires`, and `token_updated_at` via `applyOAuthCredentials`) and
+ * `expires`, and `tokenUpdatedAt` via `applyOAuthCredentials`) and
  * returns the new access token.
- * @param {{ refreshToken: string, access?: string, expires?: number, token_updated_at?: number }} account
+ * @param {{ refreshToken: string, access?: string, expires?: number, tokenUpdatedAt?: number }} account
+ * @param {{ accounts?: Array<Record<string, any>> } | null | undefined} [storage]
  * @returns {Promise<string | null>}
  */
-export async function refreshAccessToken(account) {
+export async function refreshAccessToken(account, storage) {
   try {
-    const json = await refreshToken(account.refreshToken, { signal: AbortSignal.timeout(5000) });
-    applyOAuthCredentials(account, {
-      refresh: json.refresh_token || account.refreshToken,
-      access: json.access_token,
-      expires: Date.now() + json.expires_in * 1000,
+    return await refreshAccountToken(account, null, "foreground", {
+      onTokensUpdated: async () => {
+        if (storage) await saveAccounts(storage);
+      },
     });
-    return json.access_token;
   } catch {
     return null;
   }
@@ -195,16 +195,17 @@ export async function fetchUsage(accessToken) {
 /**
  * Ensure an account has a valid access token and fetch its usage data.
  * @param {{ refreshToken: string, access?: string, expires?: number, enabled: boolean }} account
+ * @param {{ accounts?: Array<Record<string, any>> } | null | undefined} [storage]
  * @returns {Promise<{ usage: Record<string, any> | null, tokenRefreshed: boolean }>}
  */
-export async function ensureTokenAndFetchUsage(account) {
+export async function ensureTokenAndFetchUsage(account, storage) {
   if (!account.enabled) return { usage: null, tokenRefreshed: false };
 
   let token = account.access;
   let tokenRefreshed = false;
 
   if (!token || !account.expires || account.expires < Date.now()) {
-    token = await refreshAccessToken(account);
+    token = await refreshAccessToken(account, storage);
     tokenRefreshed = !!token;
     if (!token) return { usage: null, tokenRefreshed: false };
   }
@@ -377,8 +378,7 @@ export async function cmdLogin() {
   const storage = ensureAccountStorage(stored);
   const applied = applyLoginCredentials(storage, credentials);
   if (applied.action === "updated") {
-    await saveAccounts(storage);
-    await syncOpenCodeAuthFromStorage(storage, { clearIfMissing: true });
+    await saveAndSync(storage);
 
     const label = credentials.email || `Account ${applied.index + 1}`;
     console.log(c.green(`Updated existing account #${applied.index + 1} (${label}).`));
@@ -391,8 +391,7 @@ export async function cmdLogin() {
   }
 
   // If this is the first account, it's already active at index 0
-  await saveAccounts(storage);
-  await syncOpenCodeAuthFromStorage(storage, { clearIfMissing: true });
+  await saveAndSync(storage);
 
   const label = credentials.email || `Account ${storage.accounts.length}`;
   console.log(c.green(`Added account #${storage.accounts.length} (${label}).`));
@@ -494,8 +493,7 @@ export async function cmdLogout(arg, opts = {}) {
   // Adjust active index
   adjustActiveIndexAfterRemoval(stored, idx);
 
-  await saveAccounts(stored);
-  await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true });
+  await saveAndSync(stored);
   console.log(c.green(`Logged out account #${n} (${label}).`));
 
   if (stored.accounts.length > 0) {
@@ -551,8 +549,7 @@ async function cmdLogoutAll(opts = {}) {
   }
 
   // Write explicit empty state so running plugin instances reconcile immediately.
-  await saveAccounts({ version: 1, accounts: [], activeIndex: 0 });
-  await syncOpenCodeAuthFromStorage({ version: 1, accounts: [], activeIndex: 0 }, { clearIfMissing: true });
+  await saveAndSync({ version: 1, accounts: [], activeIndex: 0 });
   console.log(c.green(`Logged out all ${count} account(s).`));
 
   return 0;
@@ -601,8 +598,7 @@ export async function cmdReauth(arg) {
     return 1;
   }
 
-  await saveAccounts(stored);
-  await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true });
+  await saveAndSync(stored);
 
   const newLabel = credentials.email || `Account ${n}`;
   console.log(c.green(`Re-authenticated account #${n} (${newLabel}).`));
@@ -635,7 +631,7 @@ export async function cmdRefresh(arg) {
 
   console.log(c.dim(`Refreshing token for account #${n} (${label})...`));
 
-  const token = await refreshAccessToken(account);
+  const token = await refreshAccessToken(account, stored);
   if (!token) {
     console.error(c.red(`Error: token refresh failed for account #${n}.`));
     console.error(c.dim("The refresh token may be invalid or expired."));
@@ -648,8 +644,7 @@ export async function cmdRefresh(arg) {
   account.enabled = true;
   resetAccountTracking(account);
 
-  await saveAccounts(stored);
-  await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true });
+  await saveAndSync(stored);
 
   const expiresIn = account.expires ? formatDuration(account.expires - Date.now()) : "unknown";
   console.log(c.green(`Token refreshed for account #${n} (${label}).`));
@@ -682,7 +677,7 @@ export async function cmdList() {
   const now = Date.now();
 
   // Fetch usage quotas for all enabled accounts in parallel
-  const usageResults = await Promise.allSettled(stored.accounts.map((acc) => ensureTokenAndFetchUsage(acc)));
+  const usageResults = await Promise.allSettled(stored.accounts.map((acc) => ensureTokenAndFetchUsage(acc, stored)));
 
   // If any tokens were refreshed, persist them back to disk
   let anyRefreshed = false;
@@ -692,7 +687,9 @@ export async function cmdList() {
     }
   }
   if (anyRefreshed) {
-    await saveAccounts(stored).catch(() => {});
+    await saveAndSync(stored).catch((err) => {
+      console.error("Warning: failed to save refreshed tokens:", err?.message);
+    });
   }
 
   console.log(c.bold("Anthropic Multi-Account Status"));
@@ -849,8 +846,7 @@ export async function cmdSwitch(arg) {
   }
 
   stored.activeIndex = idx;
-  await saveAccounts(stored);
-  await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true });
+  await saveAndSync(stored);
 
   const label = stored.accounts[idx].email || `Account ${n}`;
   console.log(c.green(`Switched active account to #${n} (${label}).`));
@@ -880,8 +876,7 @@ export async function cmdEnable(arg) {
   }
 
   stored.accounts[idx].enabled = true;
-  await saveAccounts(stored);
-  await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true });
+  await saveAndSync(stored);
 
   const label = stored.accounts[idx].email || `Account ${n}`;
   console.log(c.green(`Enabled account #${n} (${label}).`));
@@ -932,8 +927,7 @@ export async function cmdDisable(arg) {
     }
   }
 
-  await saveAccounts(stored);
-  await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true });
+  await saveAndSync(stored);
 
   console.log(c.yellow(`Disabled account #${n} (${label}).`));
   if (switchedTo !== null) {
@@ -988,8 +982,7 @@ export async function cmdRemove(arg, opts = {}) {
   // Adjust active index
   adjustActiveIndexAfterRemoval(stored, idx);
 
-  await saveAccounts(stored);
-  await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true });
+  await saveAndSync(stored);
   console.log(c.green(`Removed account #${n} (${label}).`));
 
   if (stored.accounts.length > 0) {
@@ -1568,8 +1561,7 @@ export async function cmdManage() {
             break;
           }
           stored.activeIndex = idx;
-          await saveAccounts(stored);
-          await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true });
+          await saveAndSync(stored);
           const switchLabel = accounts[idx].email || `Account ${num}`;
           console.log(c.green(`Switched to #${num} (${switchLabel}).`));
           break;
@@ -1585,8 +1577,7 @@ export async function cmdManage() {
             break;
           }
           stored.accounts[idx].enabled = true;
-          await saveAccounts(stored);
-          await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true });
+          await saveAndSync(stored);
           console.log(c.green(`Enabled account #${num}.`));
           break;
         }
@@ -1611,8 +1602,7 @@ export async function cmdManage() {
             const nextEnabled = accounts.findIndex((a) => a.enabled && accounts.indexOf(a) !== idx);
             if (nextEnabled >= 0) stored.activeIndex = nextEnabled;
           }
-          await saveAccounts(stored);
-          await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true });
+          await saveAndSync(stored);
           console.log(c.yellow(`Disabled account #${num}.`));
           break;
         }
@@ -1628,8 +1618,7 @@ export async function cmdManage() {
             stored.accounts.splice(idx, 1);
             // Adjust active index
             adjustActiveIndexAfterRemoval(stored, idx);
-            await saveAccounts(stored);
-            await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true });
+            await saveAndSync(stored);
             console.log(c.green(`Removed account #${num}.`));
           } else {
             console.log(c.dim("Cancelled."));

@@ -34,9 +34,6 @@
     "prettier": "^3.8.1",
     "vitest": "^4.0.18"
   },
-  "dependencies": {
-    "@openauthjs/openauth": "^0.4.3"
-  },
   "engines": {
     "node": ">=20"
   }

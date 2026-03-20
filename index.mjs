@@ -2,19 +2,31 @@ import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { AccountManager } from "./lib/accounts.mjs";
 import { main as cliMain } from "./cli.mjs";
-import { authorize, exchange, refreshToken } from "./lib/oauth.mjs";
+import { authorize, exchange } from "./lib/oauth.mjs";
 import { loadConfig } from "./lib/config.mjs";
-import { loadAccounts, saveAccounts, clearAccounts, hasAccountsStorageFile } from "./lib/storage.mjs";
+import { loadAccounts, saveAndSync, clearAccounts, hasAccountsStorageFile } from "./lib/storage.mjs";
 import {
   adjustActiveIndexAfterRemoval,
   applyLoginCredentials,
   applyReauthCredentials,
   ensureAccountStorage,
 } from "./lib/account-state.mjs";
-import { acquireRefreshLock, releaseRefreshLock } from "./lib/refresh-lock.mjs";
 import { resolveSlashCommandName, isDestructiveCommand, isInteractiveOnlyCommand } from "./lib/commands.mjs";
 import { isAccountSpecificError, parseRateLimitReason, parseRetryAfterHeader } from "./lib/backoff.mjs";
-import { getHeaderProfile, getDefaultBetas, getBillingHeaderBlock } from "./lib/request-headers.mjs";
+import { getBillingHeaderBlock } from "./lib/request-headers.mjs";
+import {
+  buildRequestHeaders,
+  extractModelName,
+  transformRequestBody,
+  transformRequestUrl,
+} from "./lib/request-transform.mjs";
+import { isEventStreamResponse, transformResponse } from "./lib/sse-stream.mjs";
+import {
+  readDiskAccountAuth,
+  markTokenStateUpdated,
+  applyDiskAuthIfFresher,
+  refreshAccountToken,
+} from "./lib/token-refresh.mjs";
 import {
   clearOpenCodeAuth,
   getOpenCodeAuth,
@@ -75,11 +87,12 @@ async function promptManageAccounts(accountManager) {
       const currentIndex = stored?.activeIndex ?? accountManager.getCurrentIndex();
 
       console.log("\nManage accounts:");
-      for (const acc of accounts) {
-        const name = acc.email || `Account ${acc.index + 1}`;
+      for (let i = 0; i < accounts.length; i++) {
+        const acc = accounts[i];
+        const name = acc.email || `Account ${i + 1}`;
         const status = acc.enabled ? "enabled" : "disabled";
-        const active = acc.index === currentIndex ? " (active)" : "";
-        console.log(`  ${acc.index + 1}. ${name} [${status}]${active}`);
+        const active = i === currentIndex ? " (active)" : "";
+        console.log(`  ${i + 1}. ${name} [${status}]${active}`);
       }
       console.log("");
 
@@ -99,8 +112,7 @@ async function promptManageAccounts(accountManager) {
           }
           stored.accounts.splice(idx, 1);
           adjustActiveIndexAfterRemoval(stored, idx);
-          await saveAccounts(stored);
-          await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true });
+          await saveAndSync(stored);
           console.log(`Removed account ${idx + 1}.`);
           return;
         }
@@ -112,6 +124,7 @@ async function promptManageAccounts(accountManager) {
       const num = parseInt(normalized, 10);
       if (!isNaN(num) && num >= 1 && num <= accounts.length) {
         const account = accounts[num - 1];
+        const wasEnabled = account.enabled;
         const enabledCount = accounts.filter((entry) => entry.enabled).length;
         if (account.enabled && enabledCount <= 1) {
           console.log("Cannot disable the last enabled account.");
@@ -126,9 +139,8 @@ async function promptManageAccounts(accountManager) {
           const nextEnabled = stored.accounts.findIndex((entry, index) => entry.enabled && index !== num - 1);
           if (nextEnabled >= 0) stored.activeIndex = nextEnabled;
         }
-        await saveAccounts(stored);
-        await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true });
-        console.log(`Account ${num} is now ${account.enabled ? "disabled" : "enabled"}.`);
+        await saveAndSync(stored);
+        console.log(`Account ${num} is now ${wasEnabled ? "disabled" : "enabled"}.`);
         continue;
       }
 
@@ -142,514 +154,6 @@ async function promptManageAccounts(accountManager) {
 // ---------------------------------------------------------------------------
 // Request building helpers (extracted from original fetch interceptor)
 // ---------------------------------------------------------------------------
-
-/**
- * Build request headers from input and init, applying OAuth requirements.
- * Preserves behaviors D1-D7.
- *
- * @param {any} input
- * @param {Record<string, any>} requestInit
- * @param {string} accessToken
- * @param {import('./lib/config.mjs').AnthropicAuthConfig['headers']} headerConfig
- * @param {string | undefined} modelName
- * @returns {Headers}
- */
-function buildRequestHeaders(input, requestInit, accessToken, headerConfig, modelName) {
-  const requestHeaders = new Headers();
-  if (input instanceof Request) {
-    input.headers.forEach((value, key) => {
-      requestHeaders.set(key, value);
-    });
-  }
-  if (requestInit.headers) {
-    if (requestInit.headers instanceof Headers) {
-      requestInit.headers.forEach((value, key) => {
-        requestHeaders.set(key, value);
-      });
-    } else if (Array.isArray(requestInit.headers)) {
-      for (const [key, value] of requestInit.headers) {
-        if (typeof value !== "undefined") {
-          requestHeaders.set(key, String(value));
-        }
-      }
-    } else {
-      for (const [key, value] of Object.entries(requestInit.headers)) {
-        if (typeof value !== "undefined") {
-          requestHeaders.set(key, String(value));
-        }
-      }
-    }
-  }
-
-  // Preserve incoming beta values before profile defaults/overrides.
-  const incomingBeta = requestHeaders.get("anthropic-beta") || "";
-  const incomingBetasList = incomingBeta
-    .split(",")
-    .map((b) => b.trim())
-    .filter(Boolean);
-
-  const profile = getHeaderProfile(headerConfig.emulation_profile);
-  const disabledHeaders = new Set(headerConfig.disable.map((name) => name.toLowerCase()));
-
-  for (const [key, value] of Object.entries(profile.headers)) {
-    if (!disabledHeaders.has(key.toLowerCase())) {
-      requestHeaders.set(key, value);
-    }
-  }
-
-  let anthropicBetaOverride = null;
-
-  for (const [key, value] of Object.entries(headerConfig.overrides)) {
-    if (key.toLowerCase() === "anthropic-beta") {
-      anthropicBetaOverride = value;
-      continue;
-    }
-    requestHeaders.set(key, value);
-  }
-
-  for (const name of disabledHeaders) {
-    requestHeaders.delete(name);
-  }
-
-  const defaultBetas = getDefaultBetas(headerConfig.emulation_profile, modelName);
-  const configuredBetas = anthropicBetaOverride
-    ? anthropicBetaOverride
-        .split(",")
-        .map((b) => b.trim())
-        .filter(Boolean)
-    : defaultBetas;
-  const mergedBetas = [...new Set([...configuredBetas, ...incomingBetasList])].join(",");
-
-  requestHeaders.set("authorization", `Bearer ${accessToken}`);
-  if (!disabledHeaders.has("anthropic-beta")) {
-    requestHeaders.set("anthropic-beta", mergedBetas);
-  }
-  requestHeaders.delete("x-api-key");
-
-  return requestHeaders;
-}
-
-/**
- * Read request model from transformed JSON body.
- * @param {string | undefined} body
- * @returns {string | undefined}
- */
-function extractModelName(body) {
-  if (!body || typeof body !== "string") return undefined;
-  try {
-    const parsed = JSON.parse(body);
-    if (parsed && typeof parsed === "object" && typeof parsed.model === "string" && parsed.model) {
-      return parsed.model;
-    }
-  } catch {
-    // ignore parse errors
-  }
-  return undefined;
-}
-
-/**
- * Transform the request body: system prompt sanitization and tool prefixing.
- * Preserves behaviors E1-E7.
- *
- * @param {string | undefined} body
- * @returns {string | undefined}
- */
-function transformRequestBody(body) {
-  if (!body || typeof body !== "string") return body;
-
-  const TOOL_PREFIX = "mcp_";
-
-  try {
-    const parsed = JSON.parse(body);
-
-    // Sanitize system prompt - server blocks "OpenCode" string
-    // Note: (?<!\/) preserves paths like /path/to/opencode-foo
-    if (parsed.system && Array.isArray(parsed.system)) {
-      parsed.system = parsed.system.map((item) => {
-        if (item.type === "text" && item.text) {
-          return {
-            ...item,
-            // Strip the OpenCode identity line — the transform hook provides the correct Claude Code identity
-            text: item.text
-              .replace(/^You are OpenCode, the best coding agent on the planet\.\n*/m, "")
-              .replace(/OpenCode/g, "Claude Code")
-              .replace(/(?<!\/)opencode/gi, "Claude"),
-          };
-        }
-        return item;
-      });
-    }
-
-    // Add prefix to tools definitions
-    if (parsed.tools && Array.isArray(parsed.tools)) {
-      parsed.tools = parsed.tools.map((tool) => ({
-        ...tool,
-        name: tool.name ? `${TOOL_PREFIX}${tool.name}` : tool.name,
-      }));
-    }
-    // Add prefix to tool_use blocks in messages
-    if (parsed.messages && Array.isArray(parsed.messages)) {
-      parsed.messages = parsed.messages.map((msg) => {
-        if (msg.content && Array.isArray(msg.content)) {
-          msg.content = msg.content.map((block) => {
-            if (block.type === "tool_use" && block.name) {
-              return {
-                ...block,
-                name: `${TOOL_PREFIX}${block.name}`,
-              };
-            }
-            return block;
-          });
-        }
-        return msg;
-      });
-    }
-    return JSON.stringify(parsed);
-  } catch {
-    // ignore parse errors
-    return body;
-  }
-}
-
-/**
- * Transform the request URL: add ?beta=true to /v1/messages.
- * Preserves behaviors F1-F3.
- *
- * @param {any} input
- * @returns {{requestInput: any, requestUrl: URL | null}}
- */
-function transformRequestUrl(input) {
-  let requestInput = input;
-  let requestUrl = null;
-  try {
-    if (typeof input === "string" || input instanceof URL) {
-      requestUrl = new URL(input.toString());
-    } else if (input instanceof Request) {
-      requestUrl = new URL(input.url);
-    }
-  } catch {
-    requestUrl = null;
-  }
-
-  if (requestUrl && requestUrl.pathname === "/v1/messages" && !requestUrl.searchParams.has("beta")) {
-    requestUrl.searchParams.set("beta", "true");
-    requestInput = input instanceof Request ? new Request(requestUrl.toString(), input) : requestUrl;
-  }
-
-  return { requestInput, requestUrl };
-}
-
-/**
- * @typedef {object} UsageStats
- * @property {number} inputTokens
- * @property {number} outputTokens
- * @property {number} cacheReadTokens
- * @property {number} cacheWriteTokens
- */
-
-/**
- * Update running usage stats from a parsed SSE event.
- * @param {any} parsed
- * @param {UsageStats} stats
- */
-function extractUsageFromSSEEvent(parsed, stats) {
-  // message_delta: cumulative usage (preferred, overwrites)
-  if (parsed?.type === "message_delta" && parsed.usage) {
-    const u = parsed.usage;
-    if (typeof u.input_tokens === "number") stats.inputTokens = u.input_tokens;
-    if (typeof u.output_tokens === "number") stats.outputTokens = u.output_tokens;
-    if (typeof u.cache_read_input_tokens === "number") stats.cacheReadTokens = u.cache_read_input_tokens;
-    if (typeof u.cache_creation_input_tokens === "number") stats.cacheWriteTokens = u.cache_creation_input_tokens;
-    return;
-  }
-
-  // message_start: initial usage (only set if we haven't seen message_delta yet)
-  if (parsed?.type === "message_start" && parsed.message?.usage) {
-    const u = parsed.message.usage;
-    if (stats.inputTokens === 0 && typeof u.input_tokens === "number") {
-      stats.inputTokens = u.input_tokens;
-    }
-    if (stats.cacheReadTokens === 0 && typeof u.cache_read_input_tokens === "number") {
-      stats.cacheReadTokens = u.cache_read_input_tokens;
-    }
-    if (stats.cacheWriteTokens === 0 && typeof u.cache_creation_input_tokens === "number") {
-      stats.cacheWriteTokens = u.cache_creation_input_tokens;
-    }
-  }
-}
-
-/**
- * Extract the combined SSE data payload from one event block.
- * @param {string} eventBlock
- * @returns {string | null}
- */
-function getSSEDataPayload(eventBlock) {
-  if (!eventBlock) return null;
-
-  const dataLines = [];
-  for (const line of eventBlock.split("\n")) {
-    if (!line.startsWith("data:")) continue;
-    dataLines.push(line.slice(5).trimStart());
-  }
-
-  if (dataLines.length === 0) return null;
-  const payload = dataLines.join("\n");
-  if (!payload || payload === "[DONE]") return null;
-  return payload;
-}
-
-/**
- * Parse one SSE event payload and return account-error details if present.
- * @param {any} parsed
- * @returns {{reason: import('./lib/backoff.mjs').RateLimitReason, invalidateToken: boolean} | null}
- */
-function getMidStreamAccountError(parsed) {
-  if (!parsed || parsed.type !== "error" || !parsed.error) {
-    return null;
-  }
-
-  const errorBody = {
-    error: {
-      type: String(parsed.error.type || ""),
-      message: String(parsed.error.message || ""),
-    },
-  };
-
-  // Mid-stream errors do not include a reliable HTTP status. Use 400-style
-  // body parsing to identify account-specific errors.
-  if (!isAccountSpecificError(400, errorBody)) {
-    return null;
-  }
-
-  const reason = parseRateLimitReason(400, errorBody);
-
-  return {
-    reason,
-    invalidateToken: reason === "AUTH_FAILED",
-  };
-}
-
-/**
- * Strip `mcp_` prefix from tool_use `name` fields in SSE data lines.
- * Only modifies `name` values inside content blocks with `"type": "tool_use"`.
- * Non-JSON lines and text blocks are left untouched.
- *
- * @param {string} text - Raw SSE chunk text (may contain multiple lines)
- * @returns {string}
- */
-function stripMcpPrefixFromSSE(text) {
-  return text.replace(/^data:\s*(.+)$/gm, (_match, jsonStr) => {
-    try {
-      const parsed = JSON.parse(jsonStr);
-      if (stripMcpPrefixFromParsedEvent(parsed)) {
-        return `data: ${JSON.stringify(parsed)}`;
-      }
-    } catch {
-      // Not valid JSON — pass through unchanged.
-    }
-    return _match;
-  });
-}
-
-/**
- * Mutate a parsed SSE event object, removing `mcp_` prefix from tool_use
- * name fields. Returns true if any modification was made.
- *
- * @param {any} parsed
- * @returns {boolean}
- */
-function stripMcpPrefixFromParsedEvent(parsed) {
-  if (!parsed || typeof parsed !== "object") return false;
-
-  let modified = false;
-
-  // content_block_start: { content_block: { type: "tool_use", name: "mcp_..." } }
-  if (
-    parsed.content_block &&
-    parsed.content_block.type === "tool_use" &&
-    typeof parsed.content_block.name === "string" &&
-    parsed.content_block.name.startsWith("mcp_")
-  ) {
-    parsed.content_block.name = parsed.content_block.name.slice(4);
-    modified = true;
-  }
-
-  // message_start: { message: { content: [{ type: "tool_use", name: "mcp_..." }] } }
-  if (parsed.message && Array.isArray(parsed.message.content)) {
-    for (const block of parsed.message.content) {
-      if (block.type === "tool_use" && typeof block.name === "string" && block.name.startsWith("mcp_")) {
-        block.name = block.name.slice(4);
-        modified = true;
-      }
-    }
-  }
-
-  // Top-level content array (non-streaming responses forwarded through SSE)
-  if (Array.isArray(parsed.content)) {
-    for (const block of parsed.content) {
-      if (block.type === "tool_use" && typeof block.name === "string" && block.name.startsWith("mcp_")) {
-        block.name = block.name.slice(4);
-        modified = true;
-      }
-    }
-  }
-
-  return modified;
-}
-
-/**
- * Wrap a response body stream to strip mcp_ prefix from tool names,
- * extract token usage stats from SSE events, and detect mid-stream
- * account-specific errors (so the account can be marked for the NEXT request).
- * Preserves behaviors G1-G5.
- *
- * @param {Response} response
- * @param {((stats: UsageStats) => void) | null} [onUsage] - Called when stream ends with final usage
- * @param {((details: {reason: import('./lib/backoff.mjs').RateLimitReason, invalidateToken: boolean}) => void) | null} [onAccountError]
- *   Called if a mid-stream error looks account-specific
- * @returns {Response}
- */
-function transformResponse(response, onUsage, onAccountError) {
-  if (!response.body) return response;
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  const encoder = new TextEncoder();
-  const EMPTY_CHUNK = new Uint8Array();
-
-  /** @type {UsageStats} */
-  const stats = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
-  let sseBuffer = "";
-  let sseRewriteBuffer = "";
-  let accountErrorHandled = false;
-
-  /**
-   * Process buffered SSE event blocks.
-   * @param {boolean} flush
-   */
-  function processSSEBuffer(flush = false) {
-    while (true) {
-      const boundary = sseBuffer.indexOf("\n\n");
-
-      if (boundary === -1) {
-        if (!flush) return;
-        if (!sseBuffer.trim()) {
-          sseBuffer = "";
-          return;
-        }
-      }
-
-      const eventBlock = boundary === -1 ? sseBuffer : sseBuffer.slice(0, boundary);
-      sseBuffer = boundary === -1 ? "" : sseBuffer.slice(boundary + 2);
-
-      const payload = getSSEDataPayload(eventBlock);
-      if (!payload) {
-        if (boundary === -1) return;
-        continue;
-      }
-
-      try {
-        const parsed = JSON.parse(payload);
-
-        if (onUsage) {
-          extractUsageFromSSEEvent(parsed, stats);
-        }
-
-        if (onAccountError && !accountErrorHandled) {
-          const details = getMidStreamAccountError(parsed);
-          if (details) {
-            accountErrorHandled = true;
-            onAccountError(details);
-          }
-        }
-      } catch {
-        // Ignore malformed event payloads.
-      }
-
-      if (boundary === -1) return;
-    }
-  }
-
-  /**
-   * Rewrite complete SSE lines while preserving chunk boundaries for streaming.
-   * Buffers trailing partial lines to avoid parsing split JSON payloads.
-   * @param {string} chunk
-   * @param {boolean} [flush]
-   * @returns {string}
-   */
-  function rewriteSSEChunk(chunk, flush = false) {
-    sseRewriteBuffer += chunk;
-
-    if (!flush) {
-      const boundary = sseRewriteBuffer.lastIndexOf("\n");
-      if (boundary === -1) return "";
-      const complete = sseRewriteBuffer.slice(0, boundary + 1);
-      sseRewriteBuffer = sseRewriteBuffer.slice(boundary + 1);
-      return stripMcpPrefixFromSSE(complete);
-    }
-
-    if (!sseRewriteBuffer) return "";
-    const finalText = stripMcpPrefixFromSSE(sseRewriteBuffer);
-    sseRewriteBuffer = "";
-    return finalText;
-  }
-
-  const stream = new ReadableStream({
-    async pull(controller) {
-      const { done, value } = await reader.read();
-      if (done) {
-        processSSEBuffer(true);
-
-        const rewrittenTail = rewriteSSEChunk("", true);
-        if (rewrittenTail) {
-          controller.enqueue(encoder.encode(rewrittenTail));
-        }
-
-        if (
-          onUsage &&
-          (stats.inputTokens > 0 || stats.outputTokens > 0 || stats.cacheReadTokens > 0 || stats.cacheWriteTokens > 0)
-        ) {
-          onUsage(stats);
-        }
-        controller.close();
-        return;
-      }
-
-      const text = decoder.decode(value, { stream: true });
-
-      if (onUsage || onAccountError) {
-        // Normalize CRLF for parser only; preserve original bytes for passthrough.
-        sseBuffer += text.replace(/\r\n/g, "\n");
-        processSSEBuffer(false);
-      }
-
-      const rewrittenText = rewriteSSEChunk(text, false);
-      if (rewrittenText) {
-        controller.enqueue(encoder.encode(rewrittenText));
-      } else {
-        // Keep the pull/read loop progressing when this chunk only extends a
-        // partial line buffered for later rewrite.
-        controller.enqueue(EMPTY_CHUNK);
-      }
-    },
-  });
-
-  return new Response(stream, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: response.headers,
-  });
-}
-
-/**
- * Check whether a response is an SSE event stream.
- * @param {Response} response
- * @returns {boolean}
- */
-function isEventStreamResponse(response) {
-  const contentType = response.headers.get("content-type") || "";
-  return contentType.toLowerCase().includes("text/event-stream");
-}
 
 /**
  * Build user-facing switch reason text for account-specific errors.
@@ -731,161 +235,6 @@ function buildNoAvailableAccountReason(accountManager, transientRefreshSkips, la
   }
 
   return parts.join("; ") || "all enabled accounts unavailable";
-}
-
-// ---------------------------------------------------------------------------
-// Token refresh (per-account)
-// ---------------------------------------------------------------------------
-
-/**
- * Read the latest auth fields for an account from disk.
- * Another instance may have rotated tokens since we loaded into memory.
- * @param {import('./lib/accounts.mjs').ManagedAccount} account
- * @returns {Promise<{refreshToken: string, access?: string, expires?: number, tokenUpdatedAt: number} | null>}
- */
-async function readDiskAccountAuth(account) {
-  try {
-    const diskData = await loadAccounts();
-    if (!diskData) return null;
-    const diskAccount =
-      diskData.accounts.find((entry) => entry.id === account.id) ||
-      diskData.accounts.find((entry) => entry.addedAt === account.addedAt) ||
-      diskData.accounts.find((entry) => entry.refreshToken === account.refreshToken);
-    if (!diskAccount) return null;
-    return {
-      refreshToken: diskAccount.refreshToken,
-      access: diskAccount.access,
-      expires: diskAccount.expires,
-      tokenUpdatedAt: diskAccount.token_updated_at,
-    };
-  } catch {
-    return null;
-  }
-}
-
-/**
- * @param {import('./lib/accounts.mjs').ManagedAccount} account
- * @param {number} [now]
- */
-function markTokenStateUpdated(account, now = Date.now()) {
-  account.tokenUpdatedAt = now;
-}
-
-/**
- * Adopt disk auth fields only when disk has fresher token state.
- * @param {import('./lib/accounts.mjs').ManagedAccount} account
- * @param {{refreshToken: string, access?: string, expires?: number, tokenUpdatedAt: number} | null} diskAuth
- * @param {{ allowExpiredFallback?: boolean }} [options]
- * @returns {boolean}
- */
-function applyDiskAuthIfFresher(account, diskAuth, options = {}) {
-  if (!diskAuth) return false;
-  const diskTokenUpdatedAt = diskAuth.tokenUpdatedAt || 0;
-  const memTokenUpdatedAt = account.tokenUpdatedAt || 0;
-  const diskHasDifferentAuth = diskAuth.refreshToken !== account.refreshToken || diskAuth.access !== account.access;
-  const memAuthExpired = !account.expires || account.expires <= Date.now();
-  const allowExpiredFallback = options.allowExpiredFallback === true;
-  if (diskTokenUpdatedAt <= memTokenUpdatedAt && !(allowExpiredFallback && diskHasDifferentAuth && memAuthExpired)) {
-    return false;
-  }
-  account.refreshToken = diskAuth.refreshToken;
-  account.access = diskAuth.access;
-  account.expires = diskAuth.expires;
-  account.tokenUpdatedAt = Math.max(memTokenUpdatedAt, diskTokenUpdatedAt);
-  return true;
-}
-
-/**
- * Refresh an account's access token.
- *
- * @param {import('./lib/accounts.mjs').ManagedAccount} account
- * @param {ReturnType<typeof import('@opencode-ai/plugin').createOpencodeClient>} client
- * @param {"foreground" | "idle"} [source]
- * @param {{ onTokensUpdated?: () => Promise<void> }} [options] - If provided,
- *   called under the cross-process lock after token update to persist rotated
- *   tokens before the lock is released.  Omitting means tokens won't be saved
- *   to disk until the caller arranges it (risking the rotation race).
- * @returns {Promise<string>} The new access token
- * @throws {Error} If refresh fails
- */
-async function refreshAccountToken(account, client, source = "foreground", { onTokensUpdated } = {}) {
-  const lockResult = await acquireRefreshLock(account.id, {
-    timeoutMs: 2_000,
-    backoffMs: 60,
-    staleMs: 20_000,
-  });
-  const lock =
-    lockResult && typeof lockResult === "object"
-      ? lockResult
-      : {
-          acquired: true,
-          lockPath: null,
-          owner: null,
-          lockInode: null,
-        };
-
-  if (!lock.acquired) {
-    const diskAuth = await readDiskAccountAuth(account);
-    const adopted = applyDiskAuthIfFresher(account, diskAuth, { allowExpiredFallback: true });
-    if (adopted && account.access && account.expires && account.expires > Date.now()) {
-      return account.access;
-    }
-    throw new Error("Refresh lock busy");
-  }
-
-  try {
-    const diskAuthBeforeRefresh = await readDiskAccountAuth(account);
-    const adopted = applyDiskAuthIfFresher(account, diskAuthBeforeRefresh);
-    if (source === "foreground" && adopted && account.access && account.expires && account.expires > Date.now()) {
-      return account.access;
-    }
-
-    const json = await refreshToken(account.refreshToken, { signal: AbortSignal.timeout(10_000) });
-
-    account.access = json.access_token;
-    account.expires = Date.now() + json.expires_in * 1000;
-    if (json.refresh_token) {
-      account.refreshToken = json.refresh_token;
-    }
-    markTokenStateUpdated(account);
-
-    // Persist new tokens to disk BEFORE releasing the cross-process lock.
-    // This is critical: if we release the lock first, another process can
-    // acquire it and read the old (now-rotated) refresh token from disk,
-    // leading to an invalid_grant failure.  The debounced requestSaveToDisk()
-    // that callers used previously left a ~1 s window where this race could
-    // (and did) happen.
-    if (onTokensUpdated) {
-      try {
-        await onTokensUpdated();
-      } catch {
-        // Best-effort: in-memory tokens remain valid for this process.
-        // The callback is responsible for scheduling its own fallback
-        // (e.g. a debounced retry) if the synchronous save fails.
-      }
-    }
-
-    // Also persist to OpenCode's auth store(s) for compatibility.
-    // This is best-effort: a persistence hiccup should not invalidate an
-    // otherwise successful refresh token exchange.
-    try {
-      await client.auth.set({
-        path: { id: "anthropic" },
-        body: { type: "oauth", refresh: account.refreshToken, access: account.access, expires: account.expires },
-      });
-    } catch {
-      // client.auth.set may fail if the OpenCode IPC channel is unavailable.
-    }
-    try {
-      await setOpenCodeAuth({ refresh: account.refreshToken, access: account.access, expires: account.expires });
-    } catch {
-      // File write may fail transiently; in-memory tokens remain valid.
-    }
-
-    return json.access_token;
-  } finally {
-    await releaseRefreshLock(lock);
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -980,36 +329,9 @@ export async function AnthropicAuthPlugin({ client }) {
    */
   async function reloadAccountManagerFromDisk() {
     if (!accountManager) return;
+    // Flush pending stats deltas before discarding in-memory state.
+    await accountManager.saveToDisk({ preserveDiskState: true }).catch(() => {});
     accountManager = await AccountManager.load(config, null);
-  }
-
-  /**
-   * Persist OAuth credentials into OpenCode auth storage for immediate compatibility.
-   * @param {string} refresh
-   * @param {string} access
-   * @param {number} expires
-   */
-  async function persistOpenCodeAuth(refresh, access, expires) {
-    // Try both persistence paths. If client.auth.set fails but the file
-    // write succeeds, we intentionally swallow the client error because
-    // the file is the durable source of truth that OpenCode reads on
-    // startup. The client API is a nice-to-have for immediate in-memory
-    // propagation but is not required for correctness.
-    let clientError = null;
-    try {
-      await client.auth.set({
-        path: { id: "anthropic" },
-        body: { type: "oauth", refresh, access, expires },
-      });
-    } catch (err) {
-      clientError = err;
-    }
-
-    try {
-      await setOpenCodeAuth({ refresh, access, expires });
-    } catch (err) {
-      throw clientError || err;
-    }
   }
 
   async function resolveFallbackOAuthAuth() {
@@ -1164,8 +486,24 @@ export async function AnthropicAuthPlugin({ client }) {
       const applied = applyLoginCredentials(stored, credentials);
       if (applied.action === "updated") {
         const acc = stored.accounts[applied.index];
-        await saveAccounts(stored);
-        await persistOpenCodeAuth(acc.refreshToken, acc.access, acc.expires);
+        const persisted = (await saveAndSync(stored)) || stored;
+        const syncAccount = getOpenCodeSyncAccount(persisted);
+        if (syncAccount?.refreshToken && syncAccount.access && syncAccount.expires) {
+          await client.auth.set({
+            path: { id: "anthropic" },
+            body: {
+              type: "oauth",
+              refresh: syncAccount.refreshToken,
+              access: syncAccount.access,
+              expires: syncAccount.expires,
+            },
+          });
+          await setOpenCodeAuth({
+            refresh: syncAccount.refreshToken,
+            access: syncAccount.access,
+            expires: syncAccount.expires,
+          });
+        }
         await reloadAccountManagerFromDisk();
         pendingSlashOAuth.delete(sessionID);
         const name = acc.email || `Account ${applied.index + 1}`;
@@ -1175,9 +513,24 @@ export async function AnthropicAuthPlugin({ client }) {
       if (applied.action === "capacity_reached") {
         return { ok: false, message: "Maximum of 10 accounts reached. Remove one first." };
       }
-      await saveAccounts(stored);
-      const newAccount = stored.accounts[applied.index];
-      await persistOpenCodeAuth(newAccount.refreshToken, newAccount.access, newAccount.expires);
+      const persisted = (await saveAndSync(stored)) || stored;
+      const syncAccount = getOpenCodeSyncAccount(persisted);
+      if (syncAccount?.refreshToken && syncAccount.access && syncAccount.expires) {
+        await client.auth.set({
+          path: { id: "anthropic" },
+          body: {
+            type: "oauth",
+            refresh: syncAccount.refreshToken,
+            access: syncAccount.access,
+            expires: syncAccount.expires,
+          },
+        });
+        await setOpenCodeAuth({
+          refresh: syncAccount.refreshToken,
+          access: syncAccount.access,
+          expires: syncAccount.expires,
+        });
+      }
       await reloadAccountManagerFromDisk();
       pendingSlashOAuth.delete(sessionID);
       const label = credentials.email || `Account ${applied.index + 1}`;
@@ -1205,8 +558,24 @@ export async function AnthropicAuthPlugin({ client }) {
     }
     const existing = applied.account;
 
-    await saveAccounts(stored);
-    await persistOpenCodeAuth(existing.refreshToken, existing.access, existing.expires);
+    const persisted = (await saveAndSync(stored)) || stored;
+    const syncAccount = getOpenCodeSyncAccount(persisted);
+    if (syncAccount?.refreshToken && syncAccount.access && syncAccount.expires) {
+      await client.auth.set({
+        path: { id: "anthropic" },
+        body: {
+          type: "oauth",
+          refresh: syncAccount.refreshToken,
+          access: syncAccount.access,
+          expires: syncAccount.expires,
+        },
+      });
+      await setOpenCodeAuth({
+        refresh: syncAccount.refreshToken,
+        access: syncAccount.access,
+        expires: syncAccount.expires,
+      });
+    }
     await reloadAccountManagerFromDisk();
     pendingSlashOAuth.delete(sessionID);
     const name = existing.email || `Account ${idx + 1}`;
@@ -1640,7 +1009,13 @@ export async function AnthropicAuthPlugin({ client }) {
 
               // Try each account at most once. If the error is account-specific,
               // switch to the next account. If it's service-wide, return immediately.
-              const maxAttempts = accountManager.getTotalAccountCount();
+              const maxAttempts = accountManager.getAccountCount();
+
+              if (maxAttempts === 0) {
+                throw new Error(
+                  "No enabled Anthropic accounts available. Enable one with 'opencode-anthropic-auth enable <N>'.",
+                );
+              }
 
               for (let attempt = 0; attempt < maxAttempts; attempt++) {
                 // Select account
@@ -1951,9 +1326,8 @@ export async function AnthropicAuthPlugin({ client }) {
                 if (applied.action === "capacity_reached") {
                   return { type: "failed", error: "Maximum of 10 accounts reached. Remove one first." };
                 }
-                await saveAccounts(stored);
                 try {
-                  await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true });
+                  await saveAndSync(stored);
                 } catch {
                   // Plugin-managed storage is now the source of truth; auth.json sync is best-effort.
                 }

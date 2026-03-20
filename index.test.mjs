@@ -24,12 +24,21 @@ vi.mock("node:readline/promises", () => ({
 // Mock storage — we control what's on "disk"
 vi.mock("./lib/storage.mjs", async (importOriginal) => {
   const original = await importOriginal();
+  const loadAccounts = vi.fn().mockResolvedValue(null);
+  const saveAccounts = vi.fn().mockResolvedValue(undefined);
+  const clearAccounts = vi.fn().mockResolvedValue(undefined);
+  const saveAndSync = vi.fn(async (stored, options = {}) => {
+    await saveAccounts(stored);
+    const { syncOpenCodeAuthFromStorage } = await import("./lib/opencode-auth.mjs");
+    await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true, ...options });
+  });
   return {
     ...original,
     hasAccountsStorageFile: vi.fn(() => false),
-    loadAccounts: vi.fn().mockResolvedValue(null),
-    saveAccounts: vi.fn().mockResolvedValue(undefined),
-    clearAccounts: vi.fn().mockResolvedValue(undefined),
+    loadAccounts,
+    saveAccounts,
+    saveAndSync,
+    clearAccounts,
   };
 });
 
@@ -77,6 +86,17 @@ import { makeAccountsData as makeFixtureAccountsData } from "./test/helpers/acco
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/** Restore mocks that are cleared by vi.resetAllMocks() but required by most tests. */
+function restoreDefaultMocks() {
+  acquireRefreshLock.mockResolvedValue({
+    acquired: true,
+    lockPath: "/tmp/opencode-test.lock",
+    owner: "test",
+    lockInode: null,
+  });
+  releaseRefreshLock.mockResolvedValue(undefined);
+}
 
 function makeClient() {
   return {
@@ -173,6 +193,7 @@ describe("plugin lifecycle", () => {
 
   beforeEach(() => {
     vi.resetAllMocks();
+    restoreDefaultMocks();
     client = makeClient();
     loadAccounts.mockResolvedValue(null);
     saveAccounts.mockResolvedValue(undefined);
@@ -441,6 +462,7 @@ describe("slash commands", () => {
 
   beforeEach(async () => {
     vi.resetAllMocks();
+    restoreDefaultMocks();
     client = makeClient();
     loadAccounts.mockResolvedValue(null);
     saveAccounts.mockResolvedValue(undefined);
@@ -674,6 +696,7 @@ describe("fetch interceptor", () => {
 
   beforeEach(async () => {
     vi.resetAllMocks();
+    restoreDefaultMocks();
     client = makeClient();
     loadAccounts.mockResolvedValue(null);
     saveAccounts.mockResolvedValue(undefined);
@@ -1027,6 +1050,7 @@ describe("fetch interceptor", () => {
     // Set up two accounts — the auth fallback provides access token for account 1.
     // Account 2 will need a token refresh before it can be used.
     vi.resetAllMocks();
+    restoreDefaultMocks();
     const fetchFn = await setupFetchFn(client, [{}, {}]);
 
     // First API request: 429 (account 1 has access token from auth fallback)
@@ -1175,6 +1199,7 @@ describe("fetch interceptor — token refresh", () => {
 
   beforeEach(() => {
     vi.resetAllMocks();
+    restoreDefaultMocks();
     client = makeClient();
     client.auth.set.mockResolvedValue(undefined);
     saveAccounts.mockResolvedValue(undefined);
@@ -1327,7 +1352,7 @@ describe("fetch interceptor — token refresh", () => {
           refreshToken: staleToken,
           access: "expired-access",
           expires: Date.now() - 1_000,
-          token_updated_at: 10,
+          tokenUpdatedAt: 10,
         },
       ]),
     );
@@ -1352,7 +1377,7 @@ describe("fetch interceptor — token refresh", () => {
           refreshToken: staleToken,
           access: "expired-access",
           expires: Date.now() - 1_000,
-          token_updated_at: 10,
+          tokenUpdatedAt: 10,
         },
       ]),
       makeAccountsData([
@@ -1361,7 +1386,7 @@ describe("fetch interceptor — token refresh", () => {
           refreshToken: rotatedToken,
           access: rotatedAccess,
           expires: Date.now() + 3_600_000,
-          token_updated_at: 999,
+          tokenUpdatedAt: 999,
         },
       ]),
     ];
@@ -1890,6 +1915,7 @@ describe("fetch interceptor — edge conditions", () => {
 
   beforeEach(() => {
     vi.resetAllMocks();
+    restoreDefaultMocks();
     client = makeClient();
     saveAccounts.mockResolvedValue(undefined);
   });
@@ -1926,6 +1952,7 @@ describe("fetch interceptor — account exhaustion", () => {
 
   beforeEach(() => {
     vi.resetAllMocks();
+    restoreDefaultMocks();
     client = makeClient();
     saveAccounts.mockResolvedValue(undefined);
   });
@@ -2298,6 +2325,7 @@ describe("OAuth exchange failure", () => {
 
   beforeEach(() => {
     vi.resetAllMocks();
+    restoreDefaultMocks();
     client = makeClient();
     loadAccounts.mockResolvedValue(null);
     saveAccounts.mockResolvedValue(undefined);
@@ -2332,6 +2360,7 @@ describe("auth menu actions", () => {
 
   beforeEach(() => {
     vi.resetAllMocks();
+    restoreDefaultMocks();
     client = makeClient();
     saveAccounts.mockResolvedValue(undefined);
   });
@@ -2469,6 +2498,7 @@ describe("header handling", () => {
 
   beforeEach(async () => {
     vi.resetAllMocks();
+    restoreDefaultMocks();
     client = makeClient();
     loadAccounts.mockResolvedValue(null);
     saveAccounts.mockResolvedValue(undefined);
@@ -2623,6 +2653,7 @@ describe("header handling", () => {
 describe("markSuccess wiring", () => {
   it("resets failure tracking on successful 200 response", async () => {
     vi.resetAllMocks();
+    restoreDefaultMocks();
     const client = makeClient();
 
     // Account with prior failures
@@ -2659,6 +2690,7 @@ describe("markSuccess wiring", () => {
 
   it("records token usage from streaming response", async () => {
     vi.resetAllMocks();
+    restoreDefaultMocks();
     const client = makeClient();
     const fetchFn = await setupFetchFn(client);
     vi.useFakeTimers();
@@ -2716,6 +2748,7 @@ describe("markSuccess wiring", () => {
 
   it("detects whitespace-formatted mid-stream error events and switches account on next request", async () => {
     vi.resetAllMocks();
+    restoreDefaultMocks();
     const client = makeClient();
 
     loadAccounts.mockResolvedValue(
@@ -2768,6 +2801,7 @@ describe("markSuccess wiring", () => {
 
   it("detects chunk-split mid-stream error events and switches account on next request", async () => {
     vi.resetAllMocks();
+    restoreDefaultMocks();
     const client = makeClient();
 
     loadAccounts.mockResolvedValue(
@@ -2825,6 +2859,7 @@ describe("markSuccess wiring", () => {
 
   it("does not switch account on mid-stream service-wide overloaded error", async () => {
     vi.resetAllMocks();
+    restoreDefaultMocks();
     const client = makeClient();
 
     loadAccounts.mockResolvedValue(
@@ -2877,6 +2912,7 @@ describe("markSuccess wiring", () => {
 
   it("ignores SSE-like payloads when response is not text/event-stream", async () => {
     vi.resetAllMocks();
+    restoreDefaultMocks();
     const client = makeClient();
 
     loadAccounts.mockResolvedValue(
@@ -2935,6 +2971,7 @@ describe("markSuccess wiring", () => {
 
     try {
       vi.resetAllMocks();
+      restoreDefaultMocks();
       const client = makeClient();
 
       loadAccounts.mockResolvedValue(makeAccountsData([{ access: "stale-access", expires: Date.now() + 3600_000 }]));
@@ -2996,6 +3033,7 @@ describe("markSuccess wiring", () => {
 
     try {
       vi.resetAllMocks();
+      restoreDefaultMocks();
       const client = makeClient();
 
       loadAccounts.mockResolvedValue(makeAccountsData([{ access: "access-1", expires: Date.now() + 3600_000 }]));
@@ -3056,6 +3094,7 @@ describe("API key creation handler", () => {
 
   beforeEach(() => {
     vi.resetAllMocks();
+    restoreDefaultMocks();
     client = makeClient();
     loadAccounts.mockResolvedValue(null);
     saveAccounts.mockResolvedValue(undefined);
