@@ -21,12 +21,7 @@ import {
   transformRequestUrl,
 } from "./lib/request-transform.mjs";
 import { isEventStreamResponse, transformResponse } from "./lib/sse-stream.mjs";
-import {
-  readDiskAccountAuth,
-  markTokenStateUpdated,
-  applyDiskAuthIfFresher,
-  refreshAccountToken,
-} from "./lib/token-refresh.mjs";
+import { readDiskAccountAuth, markTokenStateUpdated, refreshAccountToken } from "./lib/token-refresh.mjs";
 import {
   clearOpenCodeAuth,
   getOpenCodeAuth,
