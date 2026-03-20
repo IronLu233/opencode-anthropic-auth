@@ -30,10 +30,23 @@
  *   help              Show this help message
  */
 
-import { loadAccounts, saveAccounts, getStoragePath, createDefaultStats } from "./lib/storage.mjs";
+import {
+  loadAccounts,
+  saveAccounts,
+  getStoragePath,
+  createDefaultStats,
+  hasAccountsStorageFile,
+} from "./lib/storage.mjs";
 import { loadConfig, loadRawConfig, saveConfig, getConfigPath, VALID_STRATEGIES } from "./lib/config.mjs";
 import { authorize, exchange, revoke, refreshToken } from "./lib/oauth.mjs";
-import { applyOAuthCredentials, resetAccountTracking, adjustActiveIndexAfterRemoval } from "./lib/account-state.mjs";
+import {
+  applyLoginCredentials,
+  applyReauthCredentials,
+  applyOAuthCredentials,
+  adjustActiveIndexAfterRemoval,
+  ensureAccountStorage,
+  resetAccountTracking,
+} from "./lib/account-state.mjs";
 import { resolveCliCommandName } from "./lib/commands.mjs";
 import { syncOpenCodeAuthFromStorage } from "./lib/opencode-auth.mjs";
 import { stripAnsi } from "./lib/util.mjs";
@@ -137,17 +150,20 @@ function rpad(str, width) {
 
 /**
  * Refresh an account's OAuth access token.
- * Mutates the account object in-place and returns the new access token.
- * @param {{ refreshToken: string, access?: string, expires?: number }} account
+ * Mutates the account object in-place (sets `refreshToken`, `access`,
+ * `expires`, and `token_updated_at` via `applyOAuthCredentials`) and
+ * returns the new access token.
+ * @param {{ refreshToken: string, access?: string, expires?: number, token_updated_at?: number }} account
  * @returns {Promise<string | null>}
  */
 export async function refreshAccessToken(account) {
   try {
     const json = await refreshToken(account.refreshToken, { signal: AbortSignal.timeout(5000) });
-    account.access = json.access_token;
-    account.expires = Date.now() + json.expires_in * 1000;
-    if (json.refresh_token) account.refreshToken = json.refresh_token;
-    account.token_updated_at = Date.now();
+    applyOAuthCredentials(account, {
+      refresh: json.refresh_token || account.refreshToken,
+      access: json.access_token,
+      expires: Date.now() + json.expires_in * 1000,
+    });
     return json.access_token;
   } catch {
     return null;
@@ -317,7 +333,7 @@ async function runOAuthFlow() {
 
     const credentials = await exchange(trimmed, verifier);
     if (credentials.type === "failed") {
-      console.error(c.red("Error: token exchange failed. The code may be invalid or expired."));
+      console.error(c.red(`Error: ${credentials.error || "token exchange failed"}.`));
       return null;
     }
 
@@ -347,49 +363,32 @@ export async function cmdLogin() {
   }
 
   const stored = await loadAccounts();
+  if (!stored && hasAccountsStorageFile()) {
+    console.error(
+      c.red("Error: account storage exists but could not be read. Restore or remove the file before logging in."),
+    );
+    return 1;
+  }
 
   const credentials = await runOAuthFlow();
   if (!credentials) return 1;
 
   // Load or create storage
-  const storage = stored || { version: 1, accounts: [], activeIndex: 0 };
-
-  // Check for duplicate refresh token
-  const existingIdx = storage.accounts.findIndex((acc) => acc.refreshToken === credentials.refresh);
-  if (existingIdx >= 0) {
-    // Update existing account
-    applyOAuthCredentials(storage.accounts[existingIdx], credentials);
-    storage.accounts[existingIdx].enabled = true;
+  const storage = ensureAccountStorage(stored);
+  const applied = applyLoginCredentials(storage, credentials);
+  if (applied.action === "updated") {
     await saveAccounts(storage);
     await syncOpenCodeAuthFromStorage(storage, { clearIfMissing: true });
 
-    const label = credentials.email || `Account ${existingIdx + 1}`;
-    console.log(c.green(`Updated existing account #${existingIdx + 1} (${label}).`));
+    const label = credentials.email || `Account ${applied.index + 1}`;
+    console.log(c.green(`Updated existing account #${applied.index + 1} (${label}).`));
     return 0;
   }
 
-  if (storage.accounts.length >= 10) {
+  if (applied.action === "capacity_reached") {
     console.error(c.red("Error: maximum of 10 accounts reached. Remove one first."));
     return 1;
   }
-
-  // Add new account
-  const now = Date.now();
-  storage.accounts.push({
-    id: `${now}:${credentials.refresh.slice(0, 12)}`,
-    email: credentials.email,
-    refreshToken: credentials.refresh,
-    access: credentials.access,
-    expires: credentials.expires,
-    token_updated_at: now,
-    addedAt: now,
-    lastUsed: 0,
-    enabled: true,
-    rateLimitResetTimes: {},
-    consecutiveFailures: 0,
-    lastFailureTime: null,
-    stats: createDefaultStats(now),
-  });
 
   // If this is the first account, it's already active at index 0
   await saveAccounts(storage);
@@ -590,11 +589,17 @@ export async function cmdReauth(arg) {
   if (!credentials) return 1;
 
   // Update the account at the target index with fresh tokens
-  applyOAuthCredentials(existing, credentials);
-
-  // Re-enable and reset failure tracking
-  existing.enabled = true;
-  resetAccountTracking(existing);
+  const applied = applyReauthCredentials(stored, idx, credentials);
+  if (applied.type === "duplicate") {
+    console.error(
+      c.red(`Error: those credentials already belong to account #${applied.index + 1}. Reauth the correct account.`),
+    );
+    return 1;
+  }
+  if (applied.type === "missing") {
+    console.error(c.red("Error: target account no longer exists."));
+    return 1;
+  }
 
   await saveAccounts(stored);
   await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true });
@@ -876,6 +881,7 @@ export async function cmdEnable(arg) {
 
   stored.accounts[idx].enabled = true;
   await saveAccounts(stored);
+  await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true });
 
   const label = stored.accounts[idx].email || `Account ${n}`;
   console.log(c.green(`Enabled account #${n} (${label}).`));
@@ -916,7 +922,7 @@ export async function cmdDisable(arg) {
   const label = stored.accounts[idx].email || `Account ${n}`;
   let switchedTo = null;
 
-  // If we disabled the active account, switch to the next enabled one
+  // If we disabled the active account, switch to the first remaining enabled account
   // (adjust before saving to avoid a TOCTOU race with the running plugin)
   if (idx === stored.activeIndex) {
     const nextEnabled = stored.accounts.findIndex((a) => a.enabled);
@@ -1563,6 +1569,7 @@ export async function cmdManage() {
           }
           stored.activeIndex = idx;
           await saveAccounts(stored);
+          await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true });
           const switchLabel = accounts[idx].email || `Account ${num}`;
           console.log(c.green(`Switched to #${num} (${switchLabel}).`));
           break;
@@ -1579,6 +1586,7 @@ export async function cmdManage() {
           }
           stored.accounts[idx].enabled = true;
           await saveAccounts(stored);
+          await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true });
           console.log(c.green(`Enabled account #${num}.`));
           break;
         }
@@ -1604,6 +1612,7 @@ export async function cmdManage() {
             if (nextEnabled >= 0) stored.activeIndex = nextEnabled;
           }
           await saveAccounts(stored);
+          await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true });
           console.log(c.yellow(`Disabled account #${num}.`));
           break;
         }
@@ -1620,6 +1629,7 @@ export async function cmdManage() {
             // Adjust active index
             adjustActiveIndexAfterRemoval(stored, idx);
             await saveAccounts(stored);
+            await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true });
             console.log(c.green(`Removed account #${num}.`));
           } else {
             console.log(c.dim("Cancelled."));

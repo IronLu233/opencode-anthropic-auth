@@ -4,13 +4,24 @@ import { AccountManager } from "./lib/accounts.mjs";
 import { main as cliMain } from "./cli.mjs";
 import { authorize, exchange, refreshToken } from "./lib/oauth.mjs";
 import { loadConfig } from "./lib/config.mjs";
-import { loadAccounts, saveAccounts, clearAccounts, createDefaultStats } from "./lib/storage.mjs";
-import { applyOAuthCredentials, resetAccountTracking } from "./lib/account-state.mjs";
+import { loadAccounts, saveAccounts, clearAccounts, hasAccountsStorageFile } from "./lib/storage.mjs";
+import {
+  adjustActiveIndexAfterRemoval,
+  applyLoginCredentials,
+  applyReauthCredentials,
+  ensureAccountStorage,
+} from "./lib/account-state.mjs";
 import { acquireRefreshLock, releaseRefreshLock } from "./lib/refresh-lock.mjs";
 import { resolveSlashCommandName, isDestructiveCommand, isInteractiveOnlyCommand } from "./lib/commands.mjs";
 import { isAccountSpecificError, parseRateLimitReason, parseRetryAfterHeader } from "./lib/backoff.mjs";
 import { getHeaderProfile, getDefaultBetas, getBillingHeaderBlock } from "./lib/request-headers.mjs";
-import { setOpenCodeAuth, syncOpenCodeAuthFromStorage } from "./lib/opencode-auth.mjs";
+import {
+  clearOpenCodeAuth,
+  getOpenCodeAuth,
+  getOpenCodeSyncAccount,
+  setOpenCodeAuth,
+  syncOpenCodeAuthFromStorage,
+} from "./lib/opencode-auth.mjs";
 import { stripAnsi } from "./lib/util.mjs";
 
 // ---------------------------------------------------------------------------
@@ -55,19 +66,23 @@ async function promptAccountMenu(accountManager) {
  * @returns {Promise<void>}
  */
 async function promptManageAccounts(accountManager) {
-  const accounts = accountManager.getAccountsSnapshot();
   const rl = createInterface({ input: stdin, output: stdout });
 
   try {
-    console.log("\nManage accounts:");
-    for (const acc of accounts) {
-      const name = acc.email || `Account ${acc.index + 1}`;
-      const status = acc.enabled ? "enabled" : "disabled";
-      console.log(`  ${acc.index + 1}. ${name} [${status}]`);
-    }
-    console.log("");
-
     while (true) {
+      const stored = await loadAccounts();
+      const accounts = stored?.accounts || accountManager.getAccountsSnapshot();
+      const currentIndex = stored?.activeIndex ?? accountManager.getCurrentIndex();
+
+      console.log("\nManage accounts:");
+      for (const acc of accounts) {
+        const name = acc.email || `Account ${acc.index + 1}`;
+        const status = acc.enabled ? "enabled" : "disabled";
+        const active = acc.index === currentIndex ? " (active)" : "";
+        console.log(`  ${acc.index + 1}. ${name} [${status}]${active}`);
+      }
+      console.log("");
+
       const answer = await rl.question("Enter account number to toggle, (d)N to delete (e.g. d1), or (b)ack: ");
       const normalized = answer.trim().toLowerCase();
 
@@ -78,7 +93,14 @@ async function promptManageAccounts(accountManager) {
       if (deleteMatch) {
         const idx = parseInt(deleteMatch[1], 10) - 1;
         if (idx >= 0 && idx < accounts.length) {
-          accountManager.removeAccount(idx);
+          if (!stored) {
+            console.log("Cannot modify accounts: storage unavailable.");
+            continue;
+          }
+          stored.accounts.splice(idx, 1);
+          adjustActiveIndexAfterRemoval(stored, idx);
+          await saveAccounts(stored);
+          await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true });
           console.log(`Removed account ${idx + 1}.`);
           return;
         }
@@ -89,8 +111,24 @@ async function promptManageAccounts(accountManager) {
       // Toggle: just the number
       const num = parseInt(normalized, 10);
       if (!isNaN(num) && num >= 1 && num <= accounts.length) {
-        const newState = accountManager.toggleAccount(num - 1);
-        console.log(`Account ${num} is now ${newState ? "enabled" : "disabled"}.`);
+        const account = accounts[num - 1];
+        const enabledCount = accounts.filter((entry) => entry.enabled).length;
+        if (account.enabled && enabledCount <= 1) {
+          console.log("Cannot disable the last enabled account.");
+          continue;
+        }
+        if (!stored) {
+          console.log("Cannot modify accounts: storage unavailable.");
+          continue;
+        }
+        stored.accounts[num - 1].enabled = !stored.accounts[num - 1].enabled;
+        if (!stored.accounts[num - 1].enabled && stored.activeIndex === num - 1) {
+          const nextEnabled = stored.accounts.findIndex((entry, index) => entry.enabled && index !== num - 1);
+          if (nextEnabled >= 0) stored.activeIndex = nextEnabled;
+        }
+        await saveAccounts(stored);
+        await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true });
+        console.log(`Account ${num} is now ${account.enabled ? "disabled" : "enabled"}.`);
         continue;
       }
 
@@ -702,14 +740,17 @@ function buildNoAvailableAccountReason(accountManager, transientRefreshSkips, la
 /**
  * Read the latest auth fields for an account from disk.
  * Another instance may have rotated tokens since we loaded into memory.
- * @param {string} accountId
+ * @param {import('./lib/accounts.mjs').ManagedAccount} account
  * @returns {Promise<{refreshToken: string, access?: string, expires?: number, tokenUpdatedAt: number} | null>}
  */
-async function readDiskAccountAuth(accountId) {
+async function readDiskAccountAuth(account) {
   try {
     const diskData = await loadAccounts();
     if (!diskData) return null;
-    const diskAccount = diskData.accounts.find((a) => a.id === accountId);
+    const diskAccount =
+      diskData.accounts.find((entry) => entry.id === account.id) ||
+      diskData.accounts.find((entry) => entry.addedAt === account.addedAt) ||
+      diskData.accounts.find((entry) => entry.refreshToken === account.refreshToken);
     if (!diskAccount) return null;
     return {
       refreshToken: diskAccount.refreshToken,
@@ -784,7 +825,7 @@ async function refreshAccountToken(account, client, source = "foreground", { onT
         };
 
   if (!lock.acquired) {
-    const diskAuth = await readDiskAccountAuth(account.id);
+    const diskAuth = await readDiskAccountAuth(account);
     const adopted = applyDiskAuthIfFresher(account, diskAuth, { allowExpiredFallback: true });
     if (adopted && account.access && account.expires && account.expires > Date.now()) {
       return account.access;
@@ -793,7 +834,7 @@ async function refreshAccountToken(account, client, source = "foreground", { onT
   }
 
   try {
-    const diskAuthBeforeRefresh = await readDiskAccountAuth(account.id);
+    const diskAuthBeforeRefresh = await readDiskAccountAuth(account);
     const adopted = applyDiskAuthIfFresher(account, diskAuthBeforeRefresh);
     if (source === "foreground" && adopted && account.access && account.expires && account.expires > Date.now()) {
       return account.access;
@@ -971,6 +1012,31 @@ export async function AnthropicAuthPlugin({ client }) {
     }
   }
 
+  async function resolveFallbackOAuthAuth() {
+    const stored = await loadAccounts();
+    const storedAccount = getOpenCodeSyncAccount(stored);
+    const storedAuth = storedAccount
+      ? {
+          type: "oauth",
+          refresh: storedAccount.refreshToken,
+          access: storedAccount.access,
+          expires: storedAccount.expires,
+        }
+      : null;
+    const openCodeAuth = await getOpenCodeAuth();
+
+    if (storedAuth && openCodeAuth) {
+      return openCodeAuth.expires > storedAuth.expires ? openCodeAuth : storedAuth;
+    }
+    return storedAuth || openCodeAuth;
+  }
+
+  async function resolveRuntimeOAuthAuth(getAuth) {
+    const auth = await getAuth();
+    if (auth?.type === "oauth") return auth;
+    return resolveFallbackOAuthAuth();
+  }
+
   /**
    * Remove expired pending OAuth flows.
    */
@@ -1042,7 +1108,7 @@ export async function AnthropicAuthPlugin({ client }) {
         url,
         "",
         `Then run: ${followup}`,
-        "(Paste the full authorization code, including #state)",
+        "(Paste the authorization code; omit any trailing #state if shown)",
       ].join("\n"),
     );
   }
@@ -1081,53 +1147,41 @@ export async function AnthropicAuthPlugin({ client }) {
 
     const credentials = await exchange(code, pending.verifier);
     if (credentials.type === "failed") {
-      return { ok: false, message: "Token exchange failed. The code may be invalid or expired." };
+      return { ok: false, message: credentials.error || "Token exchange failed. The code may be invalid or expired." };
     }
 
-    const stored = (await loadAccounts()) || { version: 1, accounts: [], activeIndex: 0 };
+    const loaded = await loadAccounts();
+    if (!loaded && hasAccountsStorageFile()) {
+      return {
+        ok: false,
+        message:
+          "Anthropic account storage exists but could not be read. Restore or remove the file before continuing.",
+      };
+    }
+    const stored = ensureAccountStorage(loaded);
 
     if (pending.mode === "login") {
-      const existingIdx = stored.accounts.findIndex((acc) => acc.refreshToken === credentials.refresh);
-      if (existingIdx >= 0) {
-        const acc = stored.accounts[existingIdx];
-        applyOAuthCredentials(acc, credentials);
-        acc.enabled = true;
-        resetAccountTracking(acc);
+      const applied = applyLoginCredentials(stored, credentials);
+      if (applied.action === "updated") {
+        const acc = stored.accounts[applied.index];
         await saveAccounts(stored);
         await persistOpenCodeAuth(acc.refreshToken, acc.access, acc.expires);
         await reloadAccountManagerFromDisk();
         pendingSlashOAuth.delete(sessionID);
-        const name = acc.email || `Account ${existingIdx + 1}`;
-        return { ok: true, message: `Updated existing account #${existingIdx + 1} (${name}).` };
+        const name = acc.email || `Account ${applied.index + 1}`;
+        return { ok: true, message: `Updated existing account #${applied.index + 1} (${name}).` };
       }
 
-      if (stored.accounts.length >= 10) {
+      if (applied.action === "capacity_reached") {
         return { ok: false, message: "Maximum of 10 accounts reached. Remove one first." };
       }
-
-      const now = Date.now();
-      stored.accounts.push({
-        id: `${now}:${credentials.refresh.slice(0, 12)}`,
-        email: credentials.email,
-        refreshToken: credentials.refresh,
-        access: credentials.access,
-        expires: credentials.expires,
-        token_updated_at: now,
-        addedAt: now,
-        lastUsed: 0,
-        enabled: true,
-        rateLimitResetTimes: {},
-        consecutiveFailures: 0,
-        lastFailureTime: null,
-        stats: createDefaultStats(now),
-      });
       await saveAccounts(stored);
-      const newAccount = stored.accounts[stored.accounts.length - 1];
+      const newAccount = stored.accounts[applied.index];
       await persistOpenCodeAuth(newAccount.refreshToken, newAccount.access, newAccount.expires);
       await reloadAccountManagerFromDisk();
       pendingSlashOAuth.delete(sessionID);
-      const label = credentials.email || `Account ${stored.accounts.length}`;
-      return { ok: true, message: `Added account #${stored.accounts.length} (${label}).` };
+      const label = credentials.email || `Account ${applied.index + 1}`;
+      return { ok: true, message: `Added account #${applied.index + 1} (${label}).` };
     }
 
     // reauth flow
@@ -1137,10 +1191,19 @@ export async function AnthropicAuthPlugin({ client }) {
       return { ok: false, message: "Target account no longer exists. Start reauth again." };
     }
 
-    const existing = stored.accounts[idx];
-    applyOAuthCredentials(existing, credentials);
-    existing.enabled = true;
-    resetAccountTracking(existing);
+    const applied = applyReauthCredentials(stored, idx, credentials);
+    if (applied.type === "missing") {
+      pendingSlashOAuth.delete(sessionID);
+      return { ok: false, message: "Target account no longer exists. Start reauth again." };
+    }
+    if (applied.type === "duplicate") {
+      pendingSlashOAuth.delete(sessionID);
+      return {
+        ok: false,
+        message: `Those credentials already belong to account #${applied.index + 1}. Reauth the correct account.`,
+      };
+    }
+    const existing = applied.account;
 
     await saveAccounts(stored);
     await persistOpenCodeAuth(existing.refreshToken, existing.access, existing.expires);
@@ -1410,7 +1473,7 @@ export async function AnthropicAuthPlugin({ client }) {
           return;
         }
 
-        const diskAuth = await readDiskAccountAuth(account.id);
+        const diskAuth = await readDiskAccountAuth(account);
         const retryToken = diskAuth?.refreshToken;
         if (retryToken && retryToken !== attemptedRefreshToken && account.refreshToken === attemptedRefreshToken) {
           account.refreshToken = retryToken;
@@ -1518,8 +1581,9 @@ export async function AnthropicAuthPlugin({ client }) {
     auth: {
       provider: "anthropic",
       async loader(getAuth, provider) {
-        const auth = await getAuth();
-        if (auth.type === "oauth") {
+        const resolvedAuth = await resolveRuntimeOAuthAuth(getAuth);
+
+        if (resolvedAuth?.type === "oauth") {
           // B1-B2: Zero out cost for max plan
           for (const model of Object.values(provider.models)) {
             model.cost = {
@@ -1534,9 +1598,9 @@ export async function AnthropicAuthPlugin({ client }) {
 
           // Initialize AccountManager from disk + OpenCode auth fallback
           accountManager = await AccountManager.load(config, {
-            refresh: auth.refresh,
-            access: auth.access,
-            expires: auth.expires,
+            refresh: resolvedAuth.refresh,
+            access: resolvedAuth.access,
+            expires: resolvedAuth.expires,
           });
 
           // If we bootstrapped from auth.json and have no stored accounts file,
@@ -1553,8 +1617,8 @@ export async function AnthropicAuthPlugin({ client }) {
              */
             async fetch(input, init) {
               // Re-read auth for non-oauth fallback
-              const currentAuth = await getAuth();
-              if (currentAuth.type !== "oauth") return fetch(input, init);
+              const currentAuth = await resolveRuntimeOAuthAuth(getAuth);
+              if (currentAuth?.type !== "oauth") return fetch(input, init);
 
               // Transform body and URL once (shared across retries)
               const requestInit = init ?? {};
@@ -1625,7 +1689,7 @@ export async function AnthropicAuthPlugin({ client }) {
                     // Belt-and-suspenders retry: on terminal/invalid_grant failures,
                     // always re-read disk token and retry once before disabling.
                     if (details.isInvalidGrant || details.isTerminalStatus) {
-                      const diskAuth = await readDiskAccountAuth(account.id);
+                      const diskAuth = await readDiskAccountAuth(account);
                       const retryToken = diskAuth?.refreshToken;
                       if (
                         retryToken &&
@@ -1822,7 +1886,10 @@ export async function AnthropicAuthPlugin({ client }) {
           authorize: async () => {
             // Check for existing accounts
             const stored = await loadAccounts();
-            if (stored && stored.accounts.length > 0 && accountManager) {
+            if (stored && stored.accounts.length > 0) {
+              if (!accountManager) {
+                accountManager = await AccountManager.load(config, null);
+              }
               const action = await promptAccountMenu(accountManager);
 
               if (action === "cancel") {
@@ -1836,7 +1903,7 @@ export async function AnthropicAuthPlugin({ client }) {
 
               if (action === "manage") {
                 await promptManageAccounts(accountManager);
-                await accountManager.saveToDisk();
+                accountManager = await AccountManager.load(config, null);
                 return {
                   url: "about:blank",
                   instructions: "Account management complete. Re-run auth to add accounts.",
@@ -1847,6 +1914,7 @@ export async function AnthropicAuthPlugin({ client }) {
 
               if (action === "fresh") {
                 await clearAccounts();
+                await clearOpenCodeAuth();
                 accountManager.clearAll();
               }
 
@@ -1869,20 +1937,35 @@ export async function AnthropicAuthPlugin({ client }) {
                 }
 
                 // Add to account pool and persist immediately
-                const countBefore = accountManager.getAccountCount();
-                accountManager.addAccount(
-                  credentials.refresh,
-                  credentials.access,
-                  credentials.expires,
-                  credentials.email,
-                );
-                await accountManager.saveToDisk();
+                const loaded = await loadAccounts();
+                if (!loaded && hasAccountsStorageFile()) {
+                  return {
+                    type: "failed",
+                    error:
+                      "Anthropic account storage exists but could not be read. Restore or remove the file before continuing.",
+                  };
+                }
+                const stored = ensureAccountStorage(loaded);
+                const countBefore = stored.accounts.length;
+                const applied = applyLoginCredentials(stored, credentials);
+                if (applied.action === "capacity_reached") {
+                  return { type: "failed", error: "Maximum of 10 accounts reached. Remove one first." };
+                }
+                await saveAccounts(stored);
+                try {
+                  await syncOpenCodeAuthFromStorage(stored, { clearIfMissing: true });
+                } catch {
+                  // Plugin-managed storage is now the source of truth; auth.json sync is best-effort.
+                }
+                accountManager = await AccountManager.load(config, null);
 
                 // Toast the result
-                const total = accountManager.getAccountCount();
+                const total = stored.accounts.length;
                 const name = credentials.email || "account";
-                if (countBefore > 0) {
+                if (applied.action === "added" && countBefore > 0) {
                   await toast(`Added ${name} — ${total} accounts`, "success");
+                } else if (applied.action === "updated") {
+                  await toast(`Updated ${name}`, "success");
                 } else {
                   await toast(`Authenticated (${name})`, "success");
                 }

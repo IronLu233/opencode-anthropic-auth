@@ -1,0 +1,124 @@
+{
+  "authorize": {
+    "classification": "must match exactly",
+    "endpoint": "https://claude.ai/oauth/authorize",
+    "reference_values": {
+      "sample_verifier": "abcdefghijklmnopqrstuvwxyzABCDE0123456789-_",
+      "sample_code_challenge": "1EOAWrZwIOQbIK4cVYxj7nd6MY8cKblxx2Fw4_nzbJ8"
+    },
+    "query": {
+      "code": "true",
+      "response_type": "code",
+      "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+      "redirect_uri": "https://console.anthropic.com/oauth/code/callback",
+      "scope": "org:create_api_key user:profile user:inference",
+      "code_challenge": "1EOAWrZwIOQbIK4cVYxj7nd6MY8cKblxx2Fw4_nzbJ8",
+      "code_challenge_method": "S256",
+      "state_source": "verifier",
+      "code_challenge_source": "sha256(verifier)"
+    },
+    "pkce": {
+      "verifier_encoding": "base64url-no-padding",
+      "challenge_encoding": "base64url-no-padding",
+      "challenge_algorithm": "sha256(verifier)"
+    }
+  },
+  "parser": {
+    "classification": "must match exactly",
+    "samples": [
+      {
+        "input": "plain-code-value",
+        "output": "plain-code-value"
+      },
+      {
+        "input": "plain-code-value#ignored-state",
+        "output": "plain-code-value"
+      }
+    ],
+    "trim_samples": [
+      {
+        "input": "  plain-code-value#ignored-state  ",
+        "output": "plain-code-value"
+      }
+    ],
+    "follow_up_examples": [
+      {
+        "input": "https://console.anthropic.com/oauth/code/callback?code=abc123&state=xyz",
+        "note": "Candidate follow-up enhancement, not part of parity with anthropic-oauth.ts"
+      }
+    ]
+  },
+  "exchange": {
+    "classification": "must match exactly",
+    "request": {
+      "method": "POST",
+      "url": "https://console.anthropic.com/v1/oauth/token",
+      "headers": {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": "claude-cli/<version> (external, cli)"
+      },
+      "body_fields": [
+        "grant_type=authorization_code",
+        "code=<parsed code>",
+        "code_verifier=<verifier>",
+        "client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+        "redirect_uri=https://console.anthropic.com/oauth/code/callback",
+        "state=<verifier>"
+      ]
+    },
+    "success_response": {
+      "access_token": "access-123",
+      "refresh_token": "refresh-123",
+      "expires_in": 3600
+    },
+    "failure_response": {
+      "status": 429,
+      "statusText": "Too Many Requests",
+      "body": {
+        "error": {
+          "type": "rate_limit_error",
+          "message": "Rate limited. Please try again later."
+        }
+      }
+    }
+  },
+  "refresh": {
+    "classification": "must match exactly",
+    "request": {
+      "method": "POST",
+      "url": "https://console.anthropic.com/v1/oauth/token",
+      "headers": {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": "claude-cli/<version> (external, cli)"
+      },
+      "body_fields": [
+        "grant_type=refresh_token",
+        "refresh_token=<refresh token>",
+        "client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+      ]
+    },
+    "success_response": {
+      "access_token": "access-123",
+      "refresh_token": "refresh-123",
+      "expires_in": 3600
+    },
+    "failure_response": {
+      "status": 400,
+      "body": {
+        "error": "invalid_grant"
+      }
+    }
+  },
+  "revoke": {
+    "classification": "must remain functionally equivalent",
+    "request": {
+      "method": "POST",
+      "url": "https://console.anthropic.com/v1/oauth/revoke",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "timeout_ms": 5000
+    },
+    "note": "Server revoke is best-effort only; local cleanup must still occur even if revoke fails."
+  }
+}

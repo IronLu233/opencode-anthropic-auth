@@ -14,6 +14,7 @@ vi.mock("./lib/storage.mjs", async (importOriginal) => {
   const original = await importOriginal();
   return {
     ...original,
+    hasAccountsStorageFile: vi.fn(() => false),
     loadAccounts: vi.fn().mockResolvedValue(null),
     saveAccounts: vi.fn().mockResolvedValue(undefined),
     clearAccounts: vi.fn().mockResolvedValue(undefined),
@@ -805,6 +806,7 @@ describe("cmdEnable", () => {
         ]),
       }),
     );
+    expect(syncOpenCodeAuthFromStorage).toHaveBeenCalledWith(expect.anything(), { clearIfMissing: true });
   });
 
   it("is a no-op for already enabled account", async () => {
@@ -1127,6 +1129,30 @@ describe("auth commands", () => {
       );
       expect(syncOpenCodeAuthFromStorage).toHaveBeenCalledWith(saved, { clearIfMissing: true });
       expect(output.text()).toContain("re-enabled");
+    } finally {
+      restoreTTY();
+    }
+  });
+
+  it("cmdReauth rejects credentials that already belong to another account", async () => {
+    const storage = makeStorage();
+    loadAccounts.mockResolvedValue(storage);
+    vi.mocked(exchange).mockResolvedValueOnce({
+      type: "success",
+      refresh: "refresh-bob",
+      access: "access-reauth",
+      expires: Date.now() + 7200_000,
+      email: "bob@example.com",
+    });
+
+    const restoreTTY = setStdinTTY(true);
+    mockReadlineAnswer("reauth-code#state");
+
+    try {
+      const code = await cmdReauth("1");
+      expect(code).toBe(1);
+      expect(output.errorText()).toContain("already belong to account #2");
+      expect(saveAccounts).not.toHaveBeenCalled();
     } finally {
       restoreTTY();
     }
@@ -1671,6 +1697,25 @@ describe("main routing", () => {
       expect(code).toBe(0);
       expect(exchange).toHaveBeenCalled();
       expect(output.text()).toContain("Re-authenticated");
+    } finally {
+      restoreTTY();
+    }
+  });
+
+  it("manage syncs OpenCode auth after switching accounts", async () => {
+    const restoreTTY = setStdinTTY(true);
+    vi.mocked(createInterface).mockReturnValue({
+      question: vi.fn().mockResolvedValueOnce("s 2").mockResolvedValueOnce("q"),
+      close: vi.fn(),
+    });
+
+    try {
+      const code = await main(["manage"]);
+      expect(code).toBe(0);
+      expect(saveAccounts).toHaveBeenCalled();
+      expect(syncOpenCodeAuthFromStorage).toHaveBeenCalledWith(expect.objectContaining({ activeIndex: 1 }), {
+        clearIfMissing: true,
+      });
     } finally {
       restoreTTY();
     }

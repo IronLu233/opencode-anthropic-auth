@@ -4,7 +4,7 @@
  * These test the wiring in index.mjs — the ordering of authorize → callback → loader,
  * the accountManager initialization, and the fetch interceptor retry loop.
  *
- * We mock external dependencies (fetch, PKCE, readline, storage fs) but exercise
+ * We mock external dependencies (fetch, readline, storage fs) but exercise
  * the real plugin code paths.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
@@ -12,14 +12,6 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 // ---------------------------------------------------------------------------
 // Mocks — must be set up before importing the module under test
 // ---------------------------------------------------------------------------
-
-// Mock @openauthjs/openauth/pkce
-vi.mock("@openauthjs/openauth/pkce", () => ({
-  generatePKCE: vi.fn(async () => ({
-    challenge: "test-challenge",
-    verifier: "test-verifier",
-  })),
-}));
 
 // Mock readline (used by promptAccountMenu / promptManageAccounts)
 vi.mock("node:readline/promises", () => ({
@@ -34,6 +26,7 @@ vi.mock("./lib/storage.mjs", async (importOriginal) => {
   const original = await importOriginal();
   return {
     ...original,
+    hasAccountsStorageFile: vi.fn(() => false),
     loadAccounts: vi.fn().mockResolvedValue(null),
     saveAccounts: vi.fn().mockResolvedValue(undefined),
     clearAccounts: vi.fn().mockResolvedValue(undefined),
@@ -46,6 +39,9 @@ vi.mock("./lib/refresh-lock.mjs", () => ({
 }));
 
 vi.mock("./lib/opencode-auth.mjs", () => ({
+  clearOpenCodeAuth: vi.fn().mockResolvedValue(undefined),
+  getOpenCodeAuth: vi.fn().mockResolvedValue(null),
+  getOpenCodeSyncAccount: vi.fn((storage) => storage?.accounts?.[storage?.activeIndex ?? 0] || null),
   setOpenCodeAuth: vi.fn().mockResolvedValue(undefined),
   syncOpenCodeAuthFromStorage: vi.fn().mockResolvedValue(undefined),
 }));
@@ -69,7 +65,12 @@ vi.stubGlobal("fetch", mockFetch);
 import { AnthropicAuthPlugin } from "./index.mjs";
 import { saveAccounts, loadAccounts, clearAccounts } from "./lib/storage.mjs";
 import { acquireRefreshLock, releaseRefreshLock } from "./lib/refresh-lock.mjs";
-import { setOpenCodeAuth, syncOpenCodeAuthFromStorage } from "./lib/opencode-auth.mjs";
+import {
+  clearOpenCodeAuth,
+  getOpenCodeAuth,
+  setOpenCodeAuth,
+  syncOpenCodeAuthFromStorage,
+} from "./lib/opencode-auth.mjs";
 import { loadConfig, DEFAULT_CONFIG } from "./lib/config.mjs";
 import { makeAccountsData as makeFixtureAccountsData } from "./test/helpers/accounts-fixtures.mjs";
 
@@ -175,6 +176,7 @@ describe("plugin lifecycle", () => {
     client = makeClient();
     loadAccounts.mockResolvedValue(null);
     saveAccounts.mockResolvedValue(undefined);
+    getOpenCodeAuth.mockResolvedValue(null);
     setOpenCodeAuth.mockResolvedValue(undefined);
     syncOpenCodeAuthFromStorage.mockResolvedValue(undefined);
   });
@@ -265,6 +267,88 @@ describe("plugin lifecycle", () => {
     expect(provider.models["claude-sonnet"].cost.output).toBe(0);
   });
 
+  it("loader bootstraps from stored accounts when built-in auth is not oauth", async () => {
+    const stored = makeAccountsData([
+      { refreshToken: "stored-refresh", access: "stored-access", expires: Date.now() + 3600_000, enabled: true },
+    ]);
+    loadAccounts.mockResolvedValue(stored);
+
+    const plugin = await AnthropicAuthPlugin({ client });
+    const provider = makeProvider();
+    const getAuth = vi.fn().mockResolvedValue({ type: "none" });
+
+    const result = await plugin.auth.loader(getAuth, provider);
+
+    expect(result.fetch).toBeTypeOf("function");
+  });
+
+  it("loader bootstraps from persisted OpenCode auth when built-in auth is not oauth", async () => {
+    loadAccounts.mockResolvedValue(null);
+    getOpenCodeAuth.mockResolvedValue({
+      type: "oauth",
+      refresh: "compat-refresh",
+      access: "compat-access",
+      expires: Date.now() + 3600_000,
+    });
+
+    const plugin = await AnthropicAuthPlugin({ client });
+    const provider = makeProvider();
+    const getAuth = vi.fn().mockResolvedValue({ type: "none" });
+
+    const result = await plugin.auth.loader(getAuth, provider);
+
+    expect(result.fetch).toBeTypeOf("function");
+    expect(saveAccounts).toHaveBeenCalledTimes(1);
+    expect(saveAccounts).toHaveBeenCalledWith(
+      expect.objectContaining({
+        accounts: expect.arrayContaining([expect.objectContaining({ refreshToken: "compat-refresh" })]),
+      }),
+    );
+  });
+
+  it("first request can use stored account auth immediately after callback success", async () => {
+    loadAccounts.mockResolvedValueOnce(null);
+
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        access_token: "access-from-oauth",
+        refresh_token: "refresh-from-oauth",
+        expires_in: 3600,
+      }),
+    });
+
+    const plugin = await AnthropicAuthPlugin({ client });
+    const method = plugin.auth.methods[0];
+    const authResult = await method.authorize();
+    const credentials = await authResult.callback("auth-code#state");
+
+    expect(credentials.type).toBe("success");
+
+    loadAccounts.mockResolvedValue(
+      makeAccountsData([
+        { refreshToken: "refresh-from-oauth", access: "access-from-oauth", expires: Date.now() + 3600_000 },
+      ]),
+    );
+
+    const provider = makeProvider();
+    const getAuth = vi.fn().mockResolvedValue({ type: "none" });
+    const result = await plugin.auth.loader(getAuth, provider);
+
+    expect(result.fetch).toBeTypeOf("function");
+
+    mockFetch.mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    await result.fetch("https://api.anthropic.com/v1/messages?beta=true", {
+      method: "POST",
+      headers: new Headers(),
+      body: JSON.stringify({ model: "claude-sonnet-4-5", messages: [{ role: "user", content: "hi" }] }),
+    });
+
+    const [, requestInit] = mockFetch.mock.calls[mockFetch.mock.calls.length - 1];
+    const headers = new Headers(requestInit.headers);
+    expect(headers.get("authorization")).toBe("Bearer access-from-oauth");
+  });
+
   it("second login adds to existing account pool", async () => {
     // First login already happened — accounts file exists
     loadAccounts.mockResolvedValue(makeAccountsData([{ refreshToken: "first-refresh", lastUsed: 2000 }]));
@@ -282,6 +366,7 @@ describe("plugin lifecycle", () => {
 
     // Reset mock to track only the second login's save
     saveAccounts.mockClear();
+    syncOpenCodeAuthFromStorage.mockClear();
 
     // Now simulate second OAuth login
     // loadAccounts returns existing accounts — but accountManager is already loaded,
@@ -542,6 +627,31 @@ describe("slash commands", () => {
     );
   });
 
+  it("rejects slash reauth when returned credentials already belong to another account", async () => {
+    const stored = makeAccountsData([
+      { refreshToken: "refresh-1", access: "access-1", expires: Date.now() + 1000 },
+      { refreshToken: "refresh-2", access: "access-2", expires: Date.now() + 1000 },
+    ]);
+    loadAccounts.mockResolvedValue(stored);
+
+    let text = await runAnthropic("reauth 1");
+    expect(text).toContain("Started reauth 1 flow");
+
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        access_token: "fresh-access",
+        refresh_token: "refresh-2",
+        expires_in: 3600,
+      }),
+    });
+
+    saveAccounts.mockClear();
+    text = await runAnthropic("reauth complete dup-code#state");
+    expect(text).toContain("already belong to account #2");
+    expect(saveAccounts).not.toHaveBeenCalled();
+  });
+
   it("returns without handling non-anthropic commands", async () => {
     await expect(
       plugin["command.execute.before"]({
@@ -600,7 +710,7 @@ describe("fetch interceptor", () => {
     expect(headers.get("accept")).toBe("application/json");
     expect(headers.get("anthropic-version")).toBe("2023-06-01");
     expect(headers.get("anthropic-dangerous-direct-browser-access")).toBe("true");
-    expect(headers.get("user-agent")).toBe("claude-cli/2.1.75 (external, cli)");
+    expect(headers.get("user-agent")).toBe("claude-cli/2.1.80 (external, cli)");
     expect(headers.get("x-app")).toBe("cli");
     expect(headers.get("x-stainless-arch")).toBe("arm64");
     expect(headers.get("x-stainless-lang")).toBe("js");
@@ -2253,6 +2363,7 @@ describe("auth menu actions", () => {
 
     // Reset saveAccounts tracking after loader's save
     saveAccounts.mockClear();
+    syncOpenCodeAuthFromStorage.mockClear();
 
     return plugin;
   }
@@ -2281,6 +2392,7 @@ describe("auth menu actions", () => {
 
     // Should have cleared accounts
     expect(clearAccounts).toHaveBeenCalled();
+    expect(clearOpenCodeAuth).toHaveBeenCalled();
 
     // Should proceed to OAuth (URL should be the authorize URL, not about:blank)
     expect(authResult.url).toContain("claude.ai/oauth/authorize");
@@ -2329,6 +2441,7 @@ describe("auth menu actions", () => {
     });
 
     saveAccounts.mockClear();
+    syncOpenCodeAuthFromStorage.mockClear();
 
     const method = plugin.auth.methods[0];
     const authResult = await method.authorize();
@@ -2336,8 +2449,9 @@ describe("auth menu actions", () => {
     expect(authResult.url).toBe("about:blank");
     expect(authResult.method).toBe("code");
 
-    // Should have saved after manage
-    expect(saveAccounts).toHaveBeenCalled();
+    // Backing out of manage without changes should not persist anything.
+    expect(saveAccounts).not.toHaveBeenCalled();
+    expect(syncOpenCodeAuthFromStorage).not.toHaveBeenCalled();
 
     // Callback should return failed (no OAuth was performed)
     const credentials = await authResult.callback("anything");

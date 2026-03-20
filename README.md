@@ -309,7 +309,7 @@ Configuration is stored at `~/.config/opencode/anthropic-auth.json`. All setting
 
   // Outbound request header emulation (Claude Code spoof profile)
   "headers": {
-    // Available: "claude-cli-default" (= "claude-cli-2.1.75"), "claude-cli-2.1.75", "claude-cli-2.1.50"
+    // Available: "claude-cli-default" (= "claude-cli-2.1.80"), "claude-cli-2.1.80", "claude-cli-2.1.75", "claude-cli-2.1.50"
     "emulation_profile": "claude-cli-default",
 
     // Override any default spoofed header
@@ -335,16 +335,18 @@ Header override behavior:
 
 ### Default Emulation Profile
 
-The default profile is `claude-cli-2.1.75`. The `claude-cli-default` alias points to the same captured Opus-style request profile, while `claude-cli-2.1.50` remains available as a legacy pinned profile.
+The default profile is `claude-cli-2.1.80`. The `claude-cli-default` alias points to the same captured Claude CLI-style request profile, while `claude-cli-2.1.75` and `claude-cli-2.1.50` remain available as pinned legacy profiles.
 
-`claude-cli-2.1.75` sends pinned Claude Code-style headers, including:
+`claude-cli-2.1.80` sends pinned Claude Code-style headers, including:
 
 - `accept: application/json`
 - `anthropic-version: 2023-06-01`
 - `anthropic-dangerous-direct-browser-access: true`
-- `user-agent: claude-cli/2.1.75 (external, cli)`
+- `user-agent: claude-cli/2.1.80 (external, cli)`
 - `x-app: cli`
 - `x-stainless-*` metadata headers (pinned values)
+
+OAuth token exchange and refresh now reuse the selected default Claude CLI user agent instead of `User-Agent: anthropic`.
 
 `anthropic-beta` defaults are model-aware:
 
