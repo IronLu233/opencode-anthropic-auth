@@ -13,10 +13,10 @@ import {
 } from "./lib/account-state.mjs";
 import { resolveSlashCommandName, isDestructiveCommand, isInteractiveOnlyCommand } from "./lib/commands.mjs";
 import { isAccountSpecificError, parseRateLimitReason, parseRetryAfterHeader } from "./lib/backoff.mjs";
-import { getBillingHeaderBlock } from "./lib/request-headers.mjs";
 import {
   buildRequestHeaders,
   extractModelName,
+  injectBillingHeaderBlock,
   transformRequestBody,
   transformRequestUrl,
 } from "./lib/request-transform.mjs";
@@ -30,6 +30,7 @@ import {
   syncOpenCodeAuthFromStorage,
 } from "./lib/opencode-auth.mjs";
 import { stripAnsi } from "./lib/util.mjs";
+import { signSerializedBodyCch } from "./lib/cch-signing.mjs";
 
 // ---------------------------------------------------------------------------
 // Account management CLI prompts
@@ -919,9 +920,6 @@ export async function AnthropicAuthPlugin({ client }) {
         }
       }
       output.system.unshift(prefix);
-      if (config.headers.billing_header) {
-        output.system.unshift(getBillingHeaderBlock(config.headers.emulation_profile));
-      }
     },
     config: async (input) => {
       input.command ??= {};
@@ -986,9 +984,22 @@ export async function AnthropicAuthPlugin({ client }) {
 
               // Transform body and URL once (shared across retries)
               const requestInit = init ?? {};
-              const body = transformRequestBody(requestInit.body);
-              const modelName = extractModelName(body);
+              let sourceBody = requestInit.body;
+              if (typeof sourceBody === "undefined" && input instanceof Request) {
+                try {
+                  sourceBody = await input.clone().text();
+                } catch {
+                  sourceBody = undefined;
+                }
+              }
+              const transformedBody = transformRequestBody(typeof sourceBody === "string" ? sourceBody : undefined);
               const { requestInput, requestUrl } = transformRequestUrl(input);
+              const unsignedBody = injectBillingHeaderBlock(transformedBody, requestUrl, config.headers);
+              const modelName = extractModelName(unsignedBody);
+              const body =
+                requestUrl?.hostname === "api.anthropic.com" && typeof unsignedBody === "string"
+                  ? await signSerializedBodyCch(unsignedBody)
+                  : unsignedBody;
               const requestMethod = String(
                 requestInit.method || (requestInput instanceof Request ? requestInput.method : "POST"),
               ).toUpperCase();
@@ -1138,7 +1149,7 @@ export async function AnthropicAuthPlugin({ client }) {
                 try {
                   response = await fetch(requestInput, {
                     ...requestInit,
-                    body,
+                    ...(typeof body === "undefined" ? {} : { body }),
                     headers: requestHeaders,
                   });
                 } catch (err) {

@@ -43,7 +43,7 @@ opencode-anthropic-auth/
   index.test.mjs         Plugin integration tests (lifecycle, fetch, transforms, slash commands)
   cli.mjs                Standalone CLI (17 subcommands, auth flows, live usage quotas)
   cli.test.mjs           CLI command tests (auth + account management + IO capture)
-  package.json           Dependencies: esbuild + vitest + eslint + prettier (dev only, zero production deps)
+  package.json           Runtime + development dependencies
   eslint.config.mjs      ESLint flat config
   .prettierrc            Prettier config
   .prettierignore        Prettier ignore patterns
@@ -53,8 +53,10 @@ opencode-anthropic-auth/
     account-state.test.mjs
     commands.mjs         Shared command registry + alias resolution (CLI + slash)
     commands.test.mjs
-    request-headers.mjs  Claude Code header emulation profiles + model-aware beta defaults
+    request-headers.mjs  Claude Code header profiles + billing-header fingerprinting helpers
     request-headers.test.mjs
+    cch-signing.mjs      Final serialized-body cch signing helper
+    cch-signing.test.mjs
     oauth.mjs            Shared OAuth helpers (authorize, exchange, revoke) — used by both plugin and CLI
     accounts.mjs         AccountManager class (pool management, selection, persistence)
     accounts.test.mjs    AccountManager tests
@@ -91,6 +93,7 @@ graph TB
         Loader[Auth Loader]
         SysTransform[System Prompt Transform]
         FetchInterceptor[Fetch Interceptor]
+        CCH[CCH Signer]
         SlashCmd -->|in-process| CLI[cli.mjs dispatch]
         SlashCmd -->|login/reauth| OAuthFlow[Slash OAuth Flow]
     end
@@ -116,6 +119,8 @@ graph TB
     Loader -->|init| AM
     FetchInterceptor -->|select account| AM
     FetchInterceptor -->|build headers| Anthropic
+    FetchInterceptor -->|sign final serialized body| CCH
+    CCH --> Anthropic
     FetchInterceptor -->|on account-specific errors| Backoff
     AM -->|select| Rotation
     AM -->|persist| Storage
@@ -160,6 +165,8 @@ sequenceDiagram
     AccountManager->>AccountManager: selectAccount(strategy)
     Plugin->>Plugin: Refresh token if expired
     Plugin->>Plugin: Transform body + URL + headers
+    Plugin->>Plugin: Optionally inject billing-header block
+    Plugin->>Plugin: Sign final serialized body cch placeholder
     Plugin->>Anthropic: POST /v1/messages?beta=true
     alt Success (200)
         Anthropic->>Plugin: Response stream
@@ -190,16 +197,19 @@ flowchart LR
     subgraph Transform
         TB[transformRequestBody]
         TU[transformRequestUrl]
+        BI[injectBillingHeaderBlock]
         TH[buildRequestHeaders]
+        CS[signSerializedBodyCch]
     end
 
     subgraph Output
-        OB["Sanitized body<br/>(OpenCode→Claude Code,<br/>tool name prefixing)"]
+        OB["Sanitized body<br/>(OpenCode→Claude Code,<br/>tool name prefixing,<br/>optional billing-header block)"]
         OU["Modified URL<br/>(?beta=true)"]
         OH["Spoofed Claude CLI headers<br/>(Bearer token,<br/>anthropic-beta,<br/>user-agent,<br/>x-stainless-*)"]
+        SB["Serialized Anthropic body<br/>(optional signed cch)"]
     end
 
-    Body --> TB --> OB
+    Body --> TB --> BI --> OB --> CS --> SB
     URL --> TU --> OU
     Headers --> TH --> OH
 
@@ -210,11 +220,16 @@ flowchart LR
 
 ### Body Transformations
 
-| Step                       | What                                                                                                           | Why                                          |
-| -------------------------- | -------------------------------------------------------------------------------------------------------------- | -------------------------------------------- |
-| System prompt sanitization | Replace "OpenCode" with "Claude Code", "opencode" with "Claude" (preserves paths like `/path/to/opencode-foo`) | Anthropic's API blocks the string "OpenCode" |
-| Tool definition prefixing  | Add `mcp_` prefix to `tools[].name`                                                                            | Required by Anthropic's OAuth API            |
-| Tool use prefixing         | Add `mcp_` prefix to `tool_use` blocks in `messages[].content`                                                 | Matches the tool definition prefixes         |
+| Step                       | What                                                                                                                                              | Why                                          |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------- |
+| System prompt sanitization | Replace "OpenCode" with "Claude Code", "opencode" with "Claude" (preserves paths like `/path/to/opencode-foo`)                                    | Anthropic's API blocks the string "OpenCode" |
+| Tool definition prefixing  | Add `mcp_` prefix to `tools[].name`                                                                                                               | Required by Anthropic's OAuth API            |
+| Tool use prefixing         | Add `mcp_` prefix to `tool_use` blocks in `messages[].content`                                                                                    | Matches the tool definition prefixes         |
+| Billing header injection   | When `headers.billing_header` is `true`, prepend a standalone `x-anthropic-billing-header:` system text block to the final Anthropic request body | Optional Claude-style attribution            |
+| `cc_version` fingerprint   | Build `cc_version` as `<profile.ccVersion>.<fingerprint>` from the first user message using Claude Code OSS-confirmed semantics                   | Match Claude Code OSS behavior               |
+| `cch` final signing        | Emit `cch=00000` first, then replace it at the final serialized Anthropic body boundary via `lib/cch-signing.mjs`                                 | Match observed request-boundary behavior     |
+
+`cc_version` fingerprinting is Claude Code OSS-confirmed. The `cch` signing algorithm is reverse-engineered and remains hypothesis-based in documentation, even though it is implemented.
 
 ### URL Transformations
 
@@ -421,14 +436,14 @@ export async function AnthropicAuthPlugin({ client }) {
 
 ### Key Integration Points
 
-| Hook                                 | When It Runs                                | What It Does                                       |
-| ------------------------------------ | ------------------------------------------- | -------------------------------------------------- |
-| `config`                             | Plugin initialization                       | Registers `/anthropic` slash command               |
-| `command.execute.before`             | User runs `/anthropic ...`                  | Routes to slash command handler (in-process CLI)   |
-| `auth.methods[].authorize()`         | User clicks "Connect Provider"              | Starts OAuth flow, returns URL + callback          |
-| `auth.methods[].callback(code)`      | User pastes auth code                       | Exchanges code for tokens, adds account            |
-| `auth.loader(getAuth, provider)`     | After auth is stored, on each state refresh | Initializes AccountManager, returns custom `fetch` |
-| `experimental.chat.system.transform` | Before each API call                        | Prepends "Claude Code" prefix to system prompt     |
+| Hook                                 | When It Runs                                | What It Does                                                                  |
+| ------------------------------------ | ------------------------------------------- | ----------------------------------------------------------------------------- |
+| `config`                             | Plugin initialization                       | Registers `/anthropic` slash command                                          |
+| `command.execute.before`             | User runs `/anthropic ...`                  | Routes to slash command handler (in-process CLI)                              |
+| `auth.methods[].authorize()`         | User clicks "Connect Provider"              | Starts OAuth flow, returns URL + callback                                     |
+| `auth.methods[].callback(code)`      | User pastes auth code                       | Exchanges code for tokens, adds account                                       |
+| `auth.loader(getAuth, provider)`     | After auth is stored, on each state refresh | Initializes AccountManager, returns custom `fetch`                            |
+| `experimental.chat.system.transform` | Before each API call                        | Prepends the Claude Code prefix and removes duplicate built-in billing blocks |
 
 ### Slash Command Architecture
 
@@ -451,6 +466,7 @@ return {
   async fetch(input, init) {
     // This replaces the default fetch for all Anthropic API calls
     // Handles: account selection, token refresh, request transformation,
+    //          optional billing-header injection + cch signing,
     //          retry loop, response transformation
   },
 };
@@ -482,15 +498,16 @@ A custom provider requires `opencode.json` config with at least one model defini
 
 ### Test Structure
 
-| File                | Tests                                                       | Coverage                     |
-| ------------------- | ----------------------------------------------------------- | ---------------------------- |
-| `backoff.test.mjs`  | Rate limit parsing, backoff calculation                     | `lib/backoff.mjs`            |
-| `rotation.test.mjs` | Health scores, token buckets, selection algorithms          | `lib/rotation.mjs`           |
-| `config.test.mjs`   | Config loading, validation, env overrides                   | `lib/config.mjs`             |
-| `storage.test.mjs`  | Account persistence, deduplication, atomic writes           | `lib/storage.mjs`            |
-| `accounts.test.mjs` | AccountManager lifecycle, pool management, empty bootstrap  | `lib/accounts.mjs`           |
-| `index.test.mjs`    | Plugin lifecycle, fetch interceptor, transforms, slash cmds | `index.mjs`, `lib/oauth.mjs` |
-| `cli.test.mjs`      | CLI auth + account commands, IO capture, live usage quotas  | `cli.mjs`                    |
+| File                   | Tests                                                       | Coverage                     |
+| ---------------------- | ----------------------------------------------------------- | ---------------------------- |
+| `backoff.test.mjs`     | Rate limit parsing, backoff calculation                     | `lib/backoff.mjs`            |
+| `rotation.test.mjs`    | Health scores, token buckets, selection algorithms          | `lib/rotation.mjs`           |
+| `config.test.mjs`      | Config loading, validation, env overrides                   | `lib/config.mjs`             |
+| `storage.test.mjs`     | Account persistence, deduplication, atomic writes           | `lib/storage.mjs`            |
+| `accounts.test.mjs`    | AccountManager lifecycle, pool management, empty bootstrap  | `lib/accounts.mjs`           |
+| `index.test.mjs`       | Plugin lifecycle, fetch interceptor, transforms, slash cmds | `index.mjs`, `lib/oauth.mjs` |
+| `cli.test.mjs`         | CLI auth + account commands, IO capture, live usage quotas  | `cli.mjs`                    |
+| `cch-signing.test.mjs` | Serialized-body `cch` signing behavior                      | `lib/cch-signing.mjs`        |
 
 ### Writing Tests
 
@@ -519,15 +536,16 @@ npx vitest run --reporter=verbose  # Verbose output
 
 ## Dependencies
 
-| Package               | Type | Purpose                                                   |
-| --------------------- | ---- | --------------------------------------------------------- |
-| `@opencode-ai/plugin` | Dev  | Plugin API type definitions (used via JSDoc)              |
-| `esbuild`             | Dev  | Bundles plugin + CLI into single files                    |
-| `vitest`              | Dev  | Test runner                                               |
-| `eslint`              | Dev  | Linter (flat config)                                      |
-| `@eslint/js`          | Dev  | ESLint recommended rules                                  |
-| `prettier`            | Dev  | Code formatter                                            |
-| `husky`               | Dev  | Git hooks (pre-commit: lint-staged, pre-push: test + fmt) |
-| `lint-staged`         | Dev  | Runs prettier + eslint on staged files                    |
+| Package               | Type    | Purpose                                                   |
+| --------------------- | ------- | --------------------------------------------------------- |
+| `xxhash-wasm`         | Runtime | Final serialized-body `cch` signing                       |
+| `@opencode-ai/plugin` | Dev     | Plugin API type definitions (used via JSDoc)              |
+| `esbuild`             | Dev     | Bundles plugin + CLI into single files                    |
+| `vitest`              | Dev     | Test runner                                               |
+| `eslint`              | Dev     | Linter (flat config)                                      |
+| `@eslint/js`          | Dev     | ESLint recommended rules                                  |
+| `prettier`            | Dev     | Code formatter                                            |
+| `husky`               | Dev     | Git hooks (pre-commit: lint-staged, pre-push: test + fmt) |
+| `lint-staged`         | Dev     | Runs prettier + eslint on staged files                    |
 
-The plugin has **zero production dependencies**. PKCE uses native `node:crypto`. The bundled dist output has no external dependencies beyond Node.js built-ins.
+The only runtime dependency is `xxhash-wasm`, which is used for final serialized-body `cch` signing. PKCE still uses native `node:crypto`.

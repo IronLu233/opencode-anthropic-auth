@@ -36,5 +36,8 @@
   },
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {
+    "xxhash-wasm": "^1.1.0"
   }
 }

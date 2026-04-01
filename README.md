@@ -312,6 +312,9 @@ Configuration is stored at `~/.config/opencode/anthropic-auth.json`. All setting
     // Available: "claude-cli-default" (= "claude-cli-2.1.80"), "claude-cli-2.1.80", "claude-cli-2.1.75", "claude-cli-2.1.50"
     "emulation_profile": "claude-cli-default",
 
+    // Optional Claude-style billing header block on Anthropic requests
+    "billing_header": false,
+
     // Override any default spoofed header
     "overrides": {
       // "user-agent": "claude-cli/2.1.75 (external, cli)"
@@ -353,7 +356,27 @@ OAuth token exchange and refresh now reuse the selected default Claude CLI user 
 - Baseline: `claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24`
 - Opus adds: `context-management-2025-06-27`
 
-The billing header stays optional and off by default.
+### Optional billing header attribution
+
+`headers.billing_header` controls an optional Claude-style attribution block. It is **off by default**.
+
+When enabled, the final Anthropic request body gets a standalone system text block in this format:
+
+```text
+x-anthropic-billing-header: cc_version=<profile.ccVersion>.<fingerprint>; cc_entrypoint=cli; cch=<value>;
+```
+
+Behavior details:
+
+- The block is only injected for Anthropic requests.
+- The block is injected at the final request-body path, not just in the earlier system prompt hook.
+- `cc_version` fingerprinting is derived from Claude Code OSS behavior.
+- Fingerprinting uses the first `role: "user"` message only.
+- It reads string content directly, or the first `type: "text"` block from array content.
+- If no usable text exists, it uses the empty-string case.
+- The fingerprint uses characters at indices `[4, 7, 20]`, falls back to `"0"`, then computes `SHA256(salt + chars + version).slice(0, 3)`.
+- `cch` starts as the placeholder `00000` and is signed at the final serialized Anthropic request boundary.
+- The current `cch` signing algorithm is reverse-engineered and should be treated as experimental behavior, not Claude Code OSS-confirmed behavior.
 
 Transport-managed headers (such as `host`, `content-length`, `connection`, `accept-encoding`) are intentionally left to the HTTP runtime.
 
@@ -371,7 +394,7 @@ When you make a request through OpenCode:
 
 1. The plugin selects an account based on your strategy
 2. It refreshes the OAuth token if expired
-3. It transforms the request (adds OAuth headers, beta flags, tool prefixes)
+3. It transforms the request (adds OAuth headers, beta flags, tool prefixes, and optional billing-header attribution)
 4. If the response is account-specific (429/401, plus 400/403 billing/quota/permission errors), it marks that account and immediately tries the next account
 5. If the response is service-wide (500/503/529), it returns the error directly (switching accounts would not help)
 6. It tries each available account at most once per request
