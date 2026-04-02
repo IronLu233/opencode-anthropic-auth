@@ -739,7 +739,7 @@ describe("fetch interceptor", () => {
     expect(headers.get("accept")).toBe("application/json");
     expect(headers.get("anthropic-version")).toBe("2023-06-01");
     expect(headers.get("anthropic-dangerous-direct-browser-access")).toBe("true");
-    expect(headers.get("user-agent")).toBe("claude-cli/2.1.80 (external, cli)");
+    expect(headers.get("user-agent")).toBe("claude-cli/2.1.90 (external, cli)");
     expect(headers.get("x-app")).toBe("cli");
     expect(headers.get("x-stainless-arch")).toBe("arm64");
     expect(headers.get("x-stainless-lang")).toBe("js");
@@ -931,7 +931,7 @@ describe("fetch interceptor", () => {
       system: [
         {
           type: "text",
-          text: `x-anthropic-billing-header: cc_version=2.1.80.${computeBillingFingerprint("hello world", "2.1.80")}; cc_entrypoint=cli; cch=00000;`,
+          text: `x-anthropic-billing-header: cc_version=2.1.90.${computeBillingFingerprint("hello world", "2.1.90")}; cc_entrypoint=cli; cch=00000;`,
         },
         { type: "text", text: "You are Claude Code, an Claude assistant." },
       ],
@@ -985,8 +985,8 @@ describe("fetch interceptor", () => {
     const firstVersion = extractCcVersionFromBillingHeader(JSON.parse(firstInit.body).system[0].text);
     const secondVersion = extractCcVersionFromBillingHeader(JSON.parse(secondInit.body).system[0].text);
 
-    expect(firstVersion).toBe(`2.1.80.${computeBillingFingerprint("hello world", "2.1.80")}`);
-    expect(secondVersion).toBe(`2.1.80.${computeBillingFingerprint("goodbye world", "2.1.80")}`);
+    expect(firstVersion).toBe(`2.1.90.${computeBillingFingerprint("hello world", "2.1.90")}`);
+    expect(secondVersion).toBe(`2.1.90.${computeBillingFingerprint("goodbye world", "2.1.90")}`);
     expect(firstVersion).not.toBe(secondVersion);
   });
 
@@ -1145,7 +1145,7 @@ describe("fetch interceptor", () => {
       system: [
         {
           type: "text",
-          text: "x-anthropic-billing-header: cc_version=2.1.80.076; cc_entrypoint=cli; cch=00000;",
+          text: `x-anthropic-billing-header: cc_version=2.1.90.${computeBillingFingerprint("", "2.1.90")}; cc_entrypoint=cli; cch=00000;`,
         },
       ],
       messages: [],

@@ -125,7 +125,7 @@ This document is a living artifact. Keep it accurate:
 
 3. Request-body signing for `cch` happens in one request path only.
    Canonical location: final Anthropic fetch boundary
-   Grep check: `rg -n 'signAnthropicRequest|CCH_PATTERN|00000' lib/ index.mjs`
+   Grep check: `rg -n 'signSerializedBodyCch|CCH_PLACEHOLDER_PATTERN|00000' lib/ index.mjs`
 
 4. No TODO/FIXME in committed code.
    Canonical location: Everywhere
@@ -143,7 +143,7 @@ rg -n "x-anthropic-billing-header|cc_version=|cch=" . | rg -v "lib/request-heade
 rg -n "FINGERPRINT_SALT|computeFingerprint|xxhash|CCH_SEED" lib/
 
 # Invariant 3
-rg -n "signAnthropicRequest|CCH_PATTERN|00000" lib/ index.mjs
+rg -n "signSerializedBodyCch|CCH_PLACEHOLDER_PATTERN|00000" lib/ index.mjs
 
 # Invariant 4
 rg -n "TODO|FIXME|HACK|XXX" .
