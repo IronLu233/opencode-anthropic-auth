@@ -353,7 +353,7 @@ OAuth token exchange and refresh now reuse the selected default Claude CLI user 
 
 `anthropic-beta` defaults are model-aware:
 
-- Baseline: `claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24,task-budgets-2026-03-13`
+- Baseline: `claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24`
 - Opus adds: `context-management-2025-06-27`
 
 ### Optional billing header attribution
