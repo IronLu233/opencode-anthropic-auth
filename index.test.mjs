@@ -7,7 +7,10 @@
  * We mock external dependencies (fetch, readline, storage fs) but exercise
  * the real plugin code paths.
  */
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { promises as fs } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 // ---------------------------------------------------------------------------
 // Mocks — must be set up before importing the module under test
@@ -85,6 +88,8 @@ import { computeBillingFingerprint } from "./lib/request-headers.mjs";
 import { signSerializedBodyCch } from "./lib/cch-signing.mjs";
 import { makeAccountsData as makeFixtureAccountsData } from "./test/helpers/accounts-fixtures.mjs";
 
+const xdgConfigHome = join(tmpdir(), `opencode-anthropic-auth-index-test-${process.pid}`);
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -98,6 +103,10 @@ function restoreDefaultMocks() {
     lockInode: null,
   });
   releaseRefreshLock.mockResolvedValue(undefined);
+  clearOpenCodeAuth.mockResolvedValue(undefined);
+  getOpenCodeAuth.mockResolvedValue(null);
+  setOpenCodeAuth.mockResolvedValue(undefined);
+  syncOpenCodeAuthFromStorage.mockResolvedValue(undefined);
 }
 
 function makeClient() {
@@ -128,6 +137,14 @@ function extractCcVersionFromBillingHeader(text) {
   return text.match(/cc_version=([\d.a-z]+)/)?.[1] ?? null;
 }
 
+function parseServerVisibleUserId(serializedBody) {
+  const body = JSON.parse(serializedBody);
+  return {
+    body,
+    userId: JSON.parse(body.metadata.user_id),
+  };
+}
+
 /**
  * Poll until condition passes or timeout.
  * @param {() => void} assertion
@@ -153,7 +170,12 @@ const tokenFactory = (index) => `refresh-${index + 1}`;
 
 /** Build a stored accounts data structure with N accounts. */
 function makeAccountsData(accountOverrides = [{}], extra = {}) {
-  return makeFixtureAccountsData(accountOverrides, extra, { tokenFactory });
+  const normalizedOverrides = accountOverrides.map((overrides, index) =>
+    Object.prototype.hasOwnProperty.call(overrides, "accountUuid")
+      ? overrides
+      : { accountUuid: `account-uuid-${index + 1}`, ...overrides },
+  );
+  return makeFixtureAccountsData(normalizedOverrides, extra, { tokenFactory });
 }
 
 /**
@@ -161,7 +183,12 @@ function makeAccountsData(accountOverrides = [{}], extra = {}) {
  * Accepts an array of account overrides (one per account) and optional auth overrides.
  */
 async function setupFetchFn(client, accountOverrides = [{}], authOverrides = {}) {
-  const data = makeAccountsData(accountOverrides);
+  const normalizedOverrides = accountOverrides.map((overrides, index) =>
+    Object.prototype.hasOwnProperty.call(overrides, "accountUuid")
+      ? overrides
+      : { accountUuid: `account-uuid-${index + 1}`, ...overrides },
+  );
+  const data = makeAccountsData(normalizedOverrides);
   loadAccounts.mockResolvedValue(data);
   saveAccounts.mockResolvedValue(undefined);
 
@@ -171,6 +198,7 @@ async function setupFetchFn(client, accountOverrides = [{}], authOverrides = {})
     refresh: data.accounts[0].refreshToken,
     access: `access-1`,
     expires: Date.now() + 3600_000,
+    accountUuid: data.accounts[0].accountUuid,
     ...authOverrides,
   });
 
@@ -190,6 +218,16 @@ function mockTokenRefresh(token = "access-new", refresh = "refresh-new") {
   };
 }
 
+beforeEach(() => {
+  vi.resetAllMocks();
+  restoreDefaultMocks();
+  process.env.XDG_CONFIG_HOME = xdgConfigHome;
+});
+
+afterEach(async () => {
+  await fs.rm(xdgConfigHome, { recursive: true, force: true });
+});
+
 // ---------------------------------------------------------------------------
 // Plugin lifecycle: authorize → callback → loader ordering
 // ---------------------------------------------------------------------------
@@ -198,8 +236,6 @@ describe("plugin lifecycle", () => {
   let client;
 
   beforeEach(() => {
-    vi.resetAllMocks();
-    restoreDefaultMocks();
     client = makeClient();
     loadAccounts.mockResolvedValue(null);
     saveAccounts.mockResolvedValue(undefined);
@@ -704,15 +740,24 @@ describe("fetch interceptor", () => {
     vi.resetAllMocks();
     restoreDefaultMocks();
     client = makeClient();
-    loadAccounts.mockResolvedValue(null);
+    loadAccounts.mockResolvedValue(
+      makeAccountsData([
+        {
+          access: "test-access",
+          expires: Date.now() + 3600_000,
+          accountUuid: "account-uuid-fallback",
+        },
+      ]),
+    );
     saveAccounts.mockResolvedValue(undefined);
 
     const plugin = await AnthropicAuthPlugin({ client });
     const getAuth = vi.fn().mockResolvedValue({
       type: "oauth",
-      refresh: "test-refresh",
+      refresh: "refresh-1",
       access: "test-access",
       expires: Date.now() + 3600_000,
+      accountUuid: "account-uuid-fallback",
     });
 
     const result = await plugin.auth.loader(getAuth, makeProvider());
@@ -878,6 +923,7 @@ describe("fetch interceptor", () => {
       refresh: "test-refresh",
       access: "test-access",
       expires: Date.now() + 3600_000,
+      accountUuid: "account-uuid-fallback",
     });
     const result = await plugin.auth.loader(getAuth, makeProvider());
 
@@ -930,6 +976,8 @@ describe("fetch interceptor", () => {
       }),
     });
 
+    const [, init] = mockFetch.mock.calls[0];
+    const { body } = parseServerVisibleUserId(init.body);
     const expectedUnsignedBody = JSON.stringify({
       system: [
         {
@@ -939,13 +987,270 @@ describe("fetch interceptor", () => {
         { type: "text", text: "You are Claude Code, an Claude assistant." },
       ],
       messages: [{ role: "user", content: "hello world" }],
-      metadata: { placeholder: "00000" },
+      metadata: {
+        placeholder: "00000",
+        user_id: body.metadata.user_id,
+      },
     });
 
-    const [, init] = mockFetch.mock.calls[0];
     expect(init.body).toBe(await signSerializedBodyCch(expectedUnsignedBody));
     expect(init.body).not.toContain("cch=00000;");
     expect(init.body).toContain('"placeholder":"00000"');
+  });
+
+  it("adds Anthropic server-visible identity headers and merged metadata", async () => {
+    const fetchFn = await setupFetchFn(client, [{ accountUuid: "account-uuid-123" }]);
+    mockFetch.mockResolvedValueOnce(new Response("", { status: 200 }));
+
+    await fetchFn("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        messages: [{ role: "user", content: "hello world" }],
+        metadata: { existing: "value" },
+      }),
+    });
+
+    const [, init] = mockFetch.mock.calls[0];
+    expect(init.headers.get("x-claude-code-session-id")).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu,
+    );
+    expect(init.headers.get("x-client-request-id")).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu,
+    );
+
+    const { body, userId } = parseServerVisibleUserId(init.body);
+    expect(body.metadata.existing).toBe("value");
+    expect(typeof body.metadata.user_id).toBe("string");
+    expect(userId.device_id).toMatch(/^[0-9a-f]{64}$/u);
+    expect(userId.session_id).toBe(init.headers.get("x-claude-code-session-id"));
+    expect(userId.account_uuid).toBe("account-uuid-123");
+  });
+
+  it("preserves caller-provided Anthropic identity headers", async () => {
+    const fetchFn = await setupFetchFn(client, [{ accountUuid: "account-uuid-123" }]);
+    mockFetch.mockResolvedValueOnce(new Response("", { status: 200 }));
+
+    await fetchFn("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-claude-code-session-id": "caller-session-id",
+        "x-client-request-id": "caller-request-id",
+      },
+      body: JSON.stringify({ messages: [{ role: "user", content: "hello world" }] }),
+    });
+
+    const [, init] = mockFetch.mock.calls[0];
+    expect(init.headers.get("x-claude-code-session-id")).toBe("caller-session-id");
+    expect(init.headers.get("x-client-request-id")).toBe("caller-request-id");
+    const { userId } = parseServerVisibleUserId(init.body);
+    expect(userId.session_id).toBe("caller-session-id");
+  });
+
+  it("keeps metadata.session_id aligned with an explicitly empty caller-provided session header", async () => {
+    const fetchFn = await setupFetchFn(client, [{ accountUuid: "account-uuid-123" }]);
+    mockFetch.mockResolvedValueOnce(new Response("", { status: 200 }));
+
+    await fetchFn("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-claude-code-session-id": "",
+      },
+      body: JSON.stringify({ messages: [{ role: "user", content: "hello world" }] }),
+    });
+
+    const [, init] = mockFetch.mock.calls[0];
+    expect(init.headers.get("x-claude-code-session-id")).toBe("");
+    const { userId } = parseServerVisibleUserId(init.body);
+    expect(userId.session_id).toBe("");
+  });
+
+  it("uses an empty account_uuid only when auth state lacks one", async () => {
+    const fetchFn = await setupFetchFn(client, [{ accountUuid: undefined }]);
+    mockFetch.mockResolvedValueOnce(new Response("", { status: 404 }));
+    mockFetch.mockResolvedValueOnce(new Response("", { status: 200 }));
+
+    await fetchFn("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({ messages: [{ role: "user", content: "hello world" }] }),
+    });
+
+    const [, init] = mockFetch.mock.calls[1];
+    const { userId } = parseServerVisibleUserId(init.body);
+    expect(userId.account_uuid).toBe("");
+  });
+
+  it("backfills account_uuid from /api/oauth/profile when missing and persists it", async () => {
+    const fetchFn = await setupFetchFn(client, [{ accountUuid: undefined }]);
+    mockFetch.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          account: { uuid: "backfilled-account-uuid", email: "backfill@example.com" },
+          organization: { uuid: "org-uuid" },
+        }),
+        { status: 200 },
+      ),
+    );
+    mockFetch.mockResolvedValueOnce(new Response("", { status: 200 }));
+
+    await fetchFn("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({ messages: [{ role: "user", content: "hello world" }] }),
+    });
+
+    expect(mockFetch.mock.calls[0][0]).toBe("https://api.anthropic.com/api/oauth/profile");
+    const [, apiInit] = mockFetch.mock.calls[1];
+    const { userId } = parseServerVisibleUserId(apiInit.body);
+    expect(userId.account_uuid).toBe("backfilled-account-uuid");
+    expect(saveAccounts).toHaveBeenCalled();
+    expect(saveAccounts.mock.calls.at(-1)?.[0].accounts[0].accountUuid).toBe("backfilled-account-uuid");
+    expect(setOpenCodeAuth).toHaveBeenCalledWith(expect.objectContaining({ accountUuid: "backfilled-account-uuid" }));
+  });
+
+  it("falls back to empty account_uuid when profile backfill fails without blocking the request", async () => {
+    const fetchFn = await setupFetchFn(client, [{ accountUuid: undefined }]);
+    mockFetch.mockResolvedValueOnce(new Response("", { status: 500 }));
+    mockFetch.mockResolvedValueOnce(new Response("", { status: 200 }));
+
+    await fetchFn("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({ messages: [{ role: "user", content: "hello world" }] }),
+    });
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    const [, apiInit] = mockFetch.mock.calls[1];
+    const { userId } = parseServerVisibleUserId(apiInit.body);
+    expect(userId.account_uuid).toBe("");
+  });
+
+  it("does not retry accountUuid profile backfill on every request after a miss", async () => {
+    const fetchFn = await setupFetchFn(client, [{ accountUuid: undefined }]);
+    mockFetch.mockResolvedValueOnce(new Response("", { status: 404 }));
+    mockFetch.mockResolvedValueOnce(new Response("", { status: 200 }));
+    mockFetch.mockResolvedValueOnce(new Response("", { status: 200 }));
+
+    await fetchFn("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({ messages: [{ role: "user", content: "first" }] }),
+    });
+
+    await fetchFn("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({ messages: [{ role: "user", content: "second" }] }),
+    });
+
+    const profileCalls = mockFetch.mock.calls.filter(([url]) => String(url).includes("/api/oauth/profile"));
+    const apiCalls = mockFetch.mock.calls.filter(([url]) => String(url).includes("/v1/messages"));
+    expect(profileCalls).toHaveLength(1);
+    expect(apiCalls).toHaveLength(2);
+  });
+
+  it("uses a fresh client request id per request while reusing the runtime session id", async () => {
+    const fetchFn = await setupFetchFn(client, [{ accountUuid: "account-uuid-123" }]);
+    mockFetch.mockResolvedValueOnce(new Response("", { status: 200 }));
+    mockFetch.mockResolvedValueOnce(new Response("", { status: 200 }));
+
+    await fetchFn("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({ messages: [{ role: "user", content: "first" }] }),
+    });
+    await fetchFn("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({ messages: [{ role: "user", content: "second" }] }),
+    });
+
+    const [, firstInit] = mockFetch.mock.calls[0];
+    const [, secondInit] = mockFetch.mock.calls[1];
+    expect(firstInit.headers.get("x-claude-code-session-id")).toBe(secondInit.headers.get("x-claude-code-session-id"));
+    expect(firstInit.headers.get("x-client-request-id")).not.toBe(secondInit.headers.get("x-client-request-id"));
+  });
+
+  it("rebuilds Anthropic metadata per attempt so account switching uses the selected accountUuid", async () => {
+    const freshExpiry = Date.now() + 3600_000;
+    const fetchFn = await setupFetchFn(client, [
+      { accountUuid: "account-uuid-1", access: "access-1", expires: freshExpiry },
+      { accountUuid: "account-uuid-2", access: "access-2", expires: freshExpiry },
+    ]);
+    mockFetch.mockRejectedValueOnce(new Error("network failure"));
+    mockFetch.mockResolvedValueOnce(new Response('{"content":[]}', { status: 200 }));
+
+    await fetchFn("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({ messages: [{ role: "user", content: "hello world" }] }),
+    });
+
+    const apiCalls = mockFetch.mock.calls.filter(([url, init]) => {
+      return String(url).includes("/v1/messages") && typeof init?.body === "string";
+    });
+    expect(apiCalls).toHaveLength(2);
+    const [, firstInit] = apiCalls[0];
+    const [, secondInit] = apiCalls[1];
+    expect(
+      apiCalls.some(([, init]) => {
+        if (typeof init.body !== "string") return false;
+        return JSON.parse(init.body).metadata?.user_id?.includes('"account_uuid":"account-uuid-2"') === true;
+      }),
+    ).toBe(true);
+    expect(firstInit.headers.get("x-client-request-id")).not.toBe(secondInit.headers.get("x-client-request-id"));
+  });
+
+  it("leaves non-Anthropic requests untouched by server-visible identity injection", async () => {
+    const fetchFn = await setupFetchFn(client, [{ accountUuid: "account-uuid-123" }]);
+    mockFetch.mockResolvedValueOnce(new Response("", { status: 200 }));
+
+    const originalBody = JSON.stringify({
+      messages: [{ role: "user", content: "hello world" }],
+      metadata: { existing: "value" },
+    });
+
+    await fetchFn("https://example.com/v1/messages", {
+      method: "POST",
+      body: originalBody,
+    });
+
+    const [, init] = mockFetch.mock.calls[0];
+    expect(init.headers.has("x-claude-code-session-id")).toBe(false);
+    expect(init.headers.has("x-client-request-id")).toBe(false);
+    expect(init.body).toBe(originalBody);
+  });
+
+  it("re-signs cch after metadata.user_id injection", async () => {
+    const { loadConfig } = await import("./lib/config.mjs");
+    loadConfig.mockReturnValue({
+      ...DEFAULT_CONFIG,
+      headers: { ...DEFAULT_CONFIG.headers, billing_header: true },
+    });
+
+    const fetchFn = await setupFetchFn(client, [{ accountUuid: "account-uuid-123" }]);
+    mockFetch.mockResolvedValueOnce(new Response("", { status: 200 }));
+
+    await fetchFn("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        system: [{ type: "text", text: "You are OpenCode, an opencode assistant." }],
+        messages: [{ role: "user", content: "hello world" }],
+        metadata: { placeholder: "00000", existing: "value" },
+      }),
+    });
+
+    const [, init] = mockFetch.mock.calls[0];
+    const { body } = parseServerVisibleUserId(init.body);
+    const expectedUnsignedBody = JSON.stringify({
+      system: [
+        {
+          type: "text",
+          text: `x-anthropic-billing-header: cc_version=2.1.90.${computeBillingFingerprint("hello world", "2.1.90")}; cc_entrypoint=cli; cch=00000;`,
+        },
+        { type: "text", text: "You are Claude Code, an Claude assistant." },
+      ],
+      messages: [{ role: "user", content: "hello world" }],
+      metadata: {
+        placeholder: "00000",
+        existing: "value",
+        user_id: body.metadata.user_id,
+      },
+    });
+
+    expect(init.body).toBe(await signSerializedBodyCch(expectedUnsignedBody));
   });
 
   it("computes cc_version fingerprint from the first user message", async () => {
@@ -1446,9 +1751,13 @@ describe("fetch interceptor", () => {
 
     const [, firstApiInit] = mockFetch.mock.calls[0];
     const [, secondApiInit] = mockFetch.mock.calls[2];
-    expect(firstApiInit.body).toBe(secondApiInit.body);
+    expect(firstApiInit.body).not.toBe(secondApiInit.body);
+    expect(parseServerVisibleUserId(firstApiInit.body).userId.account_uuid).toBe("account-uuid-1");
+    expect(parseServerVisibleUserId(secondApiInit.body).userId.account_uuid).toBe("account-uuid-2");
     expect(firstApiInit.body).not.toContain("cch=00000;");
+    expect(secondApiInit.body).not.toContain("cch=00000;");
     expect(firstApiInit.body).toContain('"placeholder":"00000"');
+    expect(secondApiInit.body).toContain('"placeholder":"00000"');
   });
 });
 
@@ -2130,8 +2439,9 @@ describe("fetch interceptor — token refresh", () => {
     const result = await plugin.auth.loader(getAuth, makeProvider());
 
     // Request-time disk reads happen in this order:
-    // 1) syncActiveIndexFromDisk, 2) retry disk read after invalid_grant.
+    // 1) syncActiveIndexFromDisk, 2) pre-refresh disk read, 3) retry disk read.
     const requestDiskReads = [
+      makeAccountsData([{ id: accountId, refreshToken: oldToken }]),
       makeAccountsData([{ id: accountId, refreshToken: oldToken }]),
       makeAccountsData([{ id: accountId, refreshToken: rotatedToken }]),
     ];
@@ -2242,8 +2552,9 @@ describe("fetch interceptor — token refresh", () => {
     });
     const result = await plugin.auth.loader(getAuth, makeProvider());
 
-    // Request-time reads: sync, retry-read.
+    // Request-time reads: sync, pre-refresh read, retry-read.
     const requestDiskReads = [
+      makeAccountsData([{ id: accountId, refreshToken: oldToken }]),
       makeAccountsData([{ id: accountId, refreshToken: oldToken }]),
       makeAccountsData([{ id: accountId, refreshToken: "also-bad-token" }]),
     ];
@@ -2875,15 +3186,24 @@ describe("header handling", () => {
     vi.resetAllMocks();
     restoreDefaultMocks();
     client = makeClient();
-    loadAccounts.mockResolvedValue(null);
+    loadAccounts.mockResolvedValue(
+      makeAccountsData([
+        {
+          access: "test-access",
+          expires: Date.now() + 3600_000,
+          accountUuid: "account-uuid-fallback",
+        },
+      ]),
+    );
     saveAccounts.mockResolvedValue(undefined);
 
     const plugin = await AnthropicAuthPlugin({ client });
     const getAuth = vi.fn().mockResolvedValue({
       type: "oauth",
-      refresh: "test-refresh",
+      refresh: "refresh-1",
       access: "test-access",
       expires: Date.now() + 3600_000,
+      accountUuid: "account-uuid-fallback",
     });
 
     const result = await plugin.auth.loader(getAuth, makeProvider());
@@ -2942,7 +3262,7 @@ describe("header handling", () => {
           "x-app": "spoof-custom",
           "user-agent": "claude-cli/9.9.9 (external, cli)",
         },
-        disable: ["x-stainless-timeout"],
+        disable: ["x-stainless-timeout", "x-claude-code-session-id", "x-client-request-id"],
       },
     });
 
@@ -2965,6 +3285,8 @@ describe("header handling", () => {
     expect(init.headers.get("x-app")).toBe("spoof-custom");
     expect(init.headers.get("user-agent")).toBe("claude-cli/9.9.9 (external, cli)");
     expect(init.headers.has("x-stainless-timeout")).toBe(false);
+    expect(init.headers.has("x-claude-code-session-id")).toBe(false);
+    expect(init.headers.has("x-client-request-id")).toBe(false);
     expect(init.headers.get("authorization")).toBe("Bearer test-access");
   });
 

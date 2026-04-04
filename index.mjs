@@ -2,7 +2,7 @@ import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { AccountManager } from "./lib/accounts.mjs";
 import { main as cliMain } from "./cli.mjs";
-import { authorize, exchange } from "./lib/oauth.mjs";
+import { authorize, exchange, fetchOAuthProfile } from "./lib/oauth.mjs";
 import { loadConfig } from "./lib/config.mjs";
 import { loadAccounts, saveAndSync, clearAccounts, hasAccountsStorageFile } from "./lib/storage.mjs";
 import {
@@ -31,6 +31,7 @@ import {
 } from "./lib/opencode-auth.mjs";
 import { stripAnsi } from "./lib/util.mjs";
 import { signSerializedBodyCch } from "./lib/cch-signing.mjs";
+import { injectServerVisibleMetadata, isAnthropicRequestUrl } from "./lib/server-visible-identity.mjs";
 
 // ---------------------------------------------------------------------------
 // Account management CLI prompts
@@ -239,6 +240,8 @@ function buildNoAvailableAccountReason(accountManager, transientRefreshSkips, la
 
 const ANTHROPIC_COMMAND_HANDLED = "__ANTHROPIC_COMMAND_HANDLED__";
 const PENDING_OAUTH_TTL_MS = 10 * 60 * 1000;
+const ACCOUNT_UUID_BACKFILL_RETRY_MS = 60 * 60 * 1000;
+const ACCOUNT_UUID_BACKFILL_TIMEOUT_MS = 3_000;
 
 /**
  * Parse command arguments with minimal quote support.
@@ -304,6 +307,7 @@ export async function AnthropicAuthPlugin({ client }) {
    * @type {Map<string, { mode: "login" | "reauth", verifier: string, targetIndex?: number, createdAt: number }>}
    */
   const pendingSlashOAuth = new Map();
+  const accountUuidBackfillAttemptedAt = new Map();
 
   /**
    * Send an informational message into the current session.
@@ -339,6 +343,7 @@ export async function AnthropicAuthPlugin({ client }) {
           refresh: storedAccount.refreshToken,
           access: storedAccount.access,
           expires: storedAccount.expires,
+          accountUuid: storedAccount.accountUuid,
         }
       : null;
     const openCodeAuth = await getOpenCodeAuth();
@@ -351,8 +356,17 @@ export async function AnthropicAuthPlugin({ client }) {
 
   async function resolveRuntimeOAuthAuth(getAuth) {
     const auth = await getAuth();
-    if (auth?.type === "oauth") return auth;
-    return resolveFallbackOAuthAuth();
+    const fallbackAuth = await resolveFallbackOAuthAuth();
+    if (auth?.type === "oauth") {
+      if (fallbackAuth?.type === "oauth" && fallbackAuth.refresh === auth.refresh && !auth.accountUuid) {
+        return {
+          ...auth,
+          accountUuid: fallbackAuth.accountUuid,
+        };
+      }
+      return auth;
+    }
+    return fallbackAuth;
   }
 
   /**
@@ -498,6 +512,7 @@ export async function AnthropicAuthPlugin({ client }) {
             refresh: syncAccount.refreshToken,
             access: syncAccount.access,
             expires: syncAccount.expires,
+            accountUuid: syncAccount.accountUuid,
           });
         }
         await reloadAccountManagerFromDisk();
@@ -525,6 +540,7 @@ export async function AnthropicAuthPlugin({ client }) {
           refresh: syncAccount.refreshToken,
           access: syncAccount.access,
           expires: syncAccount.expires,
+          accountUuid: syncAccount.accountUuid,
         });
       }
       await reloadAccountManagerFromDisk();
@@ -570,6 +586,7 @@ export async function AnthropicAuthPlugin({ client }) {
         refresh: syncAccount.refreshToken,
         access: syncAccount.access,
         expires: syncAccount.expires,
+        accountUuid: syncAccount.accountUuid,
       });
     }
     await reloadAccountManagerFromDisk();
@@ -963,6 +980,7 @@ export async function AnthropicAuthPlugin({ client }) {
             refresh: resolvedAuth.refresh,
             access: resolvedAuth.access,
             expires: resolvedAuth.expires,
+            accountUuid: resolvedAuth.accountUuid,
           });
 
           // If we bootstrapped from auth.json and have no stored accounts file,
@@ -996,10 +1014,6 @@ export async function AnthropicAuthPlugin({ client }) {
               const { requestInput, requestUrl } = transformRequestUrl(input);
               const unsignedBody = injectBillingHeaderBlock(transformedBody, requestUrl, config.headers);
               const modelName = extractModelName(unsignedBody);
-              const body =
-                requestUrl?.hostname === "api.anthropic.com" && typeof unsignedBody === "string"
-                  ? await signSerializedBodyCch(unsignedBody)
-                  : unsignedBody;
               const requestMethod = String(
                 requestInit.method || (requestInput instanceof Request ? requestInput.method : "POST"),
               ).toUpperCase();
@@ -1141,12 +1155,60 @@ export async function AnthropicAuthPlugin({ client }) {
                 // Keep non-active accounts warm without blocking the request.
                 maybeRefreshIdleAccounts(account);
 
+                const lastBackfillAttempt = accountUuidBackfillAttemptedAt.get(account.id) || 0;
+                const shouldAttemptAccountUuidBackfill =
+                  isAnthropicRequestUrl(requestUrl) &&
+                  !account.accountUuid &&
+                  accessToken &&
+                  Date.now() - lastBackfillAttempt >= ACCOUNT_UUID_BACKFILL_RETRY_MS;
+
+                if (shouldAttemptAccountUuidBackfill) {
+                  accountUuidBackfillAttemptedAt.set(account.id, Date.now());
+                  try {
+                    const profile = await fetchOAuthProfile(accessToken, {
+                      signal: AbortSignal.timeout(ACCOUNT_UUID_BACKFILL_TIMEOUT_MS),
+                    });
+                    if (profile?.accountUuid) {
+                      account.accountUuid = profile.accountUuid;
+                      if (profile.email && !account.email) {
+                        account.email = profile.email;
+                      }
+                      accountUuidBackfillAttemptedAt.delete(account.id);
+                      await accountManager.saveToDisk({ preserveDiskState: true }).catch(() => {});
+                      await setOpenCodeAuth({
+                        refresh: account.refreshToken,
+                        access: account.access,
+                        expires: account.expires,
+                        accountUuid: account.accountUuid,
+                      }).catch(() => {});
+                    }
+                  } catch {
+                    // Best-effort identity backfill must never block the request.
+                  }
+                }
+
                 // Build headers with the selected account's token
-                const requestHeaders = buildRequestHeaders(input, requestInit, accessToken, config.headers, modelName);
+                const requestHeaders = buildRequestHeaders(
+                  input,
+                  requestInit,
+                  accessToken,
+                  config.headers,
+                  modelName,
+                  requestUrl,
+                );
 
                 // Execute the request
                 let response;
                 try {
+                  const requestBodyWithIdentity = await injectServerVisibleMetadata(unsignedBody, requestUrl, {
+                    accountUuid: account.accountUuid || "",
+                    sessionId: requestHeaders.get("x-claude-code-session-id") ?? undefined,
+                  });
+                  const body =
+                    isAnthropicRequestUrl(requestUrl) && typeof requestBodyWithIdentity === "string"
+                      ? await signSerializedBodyCch(requestBodyWithIdentity)
+                      : requestBodyWithIdentity;
+
                   response = await fetch(requestInput, {
                     ...requestInit,
                     ...(typeof body === "undefined" ? {} : { body }),
