@@ -798,7 +798,10 @@ describe("fetch interceptor", () => {
 
     const [, init] = mockFetch.mock.calls[0];
     const body = JSON.parse(init.body);
-    expect(body.system[0].text).toBe("You are Claude Code, an Claude assistant.");
+    expect(body.system[0].text).toMatch(
+      /^x-anthropic-billing-header: cc_version=[\d.a-z]+; cc_entrypoint=cli; cch=[0-9a-f]{5};$/,
+    );
+    expect(body.system[1].text).toBe("You are Claude Code, an Claude assistant.");
   });
 
   it("strips OpenCode identity line from system prompt", async () => {
@@ -820,8 +823,8 @@ describe("fetch interceptor", () => {
     const [, init] = mockFetch.mock.calls[0];
     const body = JSON.parse(init.body);
     // Identity line stripped; remaining text still gets OpenCode->Claude Code rewrite
-    expect(body.system[0].text).not.toContain("best coding agent on the planet");
-    expect(body.system[0].text).toContain("You are an interactive CLI tool.");
+    expect(body.system[1].text).not.toContain("best coding agent on the planet");
+    expect(body.system[1].text).toContain("You are an interactive CLI tool.");
   });
 
   it("preserves paths containing opencode in system prompt", async () => {
@@ -837,7 +840,7 @@ describe("fetch interceptor", () => {
 
     const [, init] = mockFetch.mock.calls[0];
     const body = JSON.parse(init.body);
-    expect(body.system[0].text).toBe("Working dir: /Users/rmk/projects/opencode-auth");
+    expect(body.system[1].text).toBe("Working dir: /Users/rmk/projects/opencode-auth");
   });
 
   it("prefixes tool names with mcp_ in request", async () => {
@@ -1102,6 +1105,12 @@ describe("fetch interceptor", () => {
   });
 
   it("does not rewrite missing system when billing header is disabled", async () => {
+    const { loadConfig } = await import("./lib/config.mjs");
+    loadConfig.mockReturnValue({
+      ...DEFAULT_CONFIG,
+      headers: { ...DEFAULT_CONFIG.headers, billing_header: false },
+    });
+
     const plugin = await AnthropicAuthPlugin({ client });
     const getAuth = vi.fn().mockResolvedValue({
       type: "oauth",

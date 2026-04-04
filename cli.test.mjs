@@ -1458,7 +1458,7 @@ describe("cmdConfig", () => {
     const text = output.text();
     expect(text).toContain("Headers");
     expect(text).toContain("Billing header:");
-    expect(text).toContain("off"); // default is off
+    expect(text).toContain("Billing header:  on");
   });
 
   it("rejects unknown subcommands", async () => {

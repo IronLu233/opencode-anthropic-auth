@@ -220,14 +220,14 @@ flowchart LR
 
 ### Body Transformations
 
-| Step                       | What                                                                                                                                              | Why                                          |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------- |
-| System prompt sanitization | Replace "OpenCode" with "Claude Code", "opencode" with "Claude" (preserves paths like `/path/to/opencode-foo`)                                    | Anthropic's API blocks the string "OpenCode" |
-| Tool definition prefixing  | Add `mcp_` prefix to `tools[].name`                                                                                                               | Required by Anthropic's OAuth API            |
-| Tool use prefixing         | Add `mcp_` prefix to `tool_use` blocks in `messages[].content`                                                                                    | Matches the tool definition prefixes         |
-| Billing header injection   | When `headers.billing_header` is `true`, prepend a standalone `x-anthropic-billing-header:` system text block to the final Anthropic request body | Optional Claude-style attribution            |
-| `cc_version` fingerprint   | Build `cc_version` as `<profile.ccVersion>.<fingerprint>` from the first user message using Claude Code OSS-confirmed semantics                   | Match Claude Code OSS behavior               |
-| `cch` final signing        | Emit `cch=00000` first, then replace it at the final serialized Anthropic body boundary via `lib/cch-signing.mjs`                                 | Match observed request-boundary behavior     |
+| Step                       | What                                                                                                                                                                | Why                                          |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------- |
+| System prompt sanitization | Replace "OpenCode" with "Claude Code", "opencode" with "Claude" (preserves paths like `/path/to/opencode-foo`)                                                      | Anthropic's API blocks the string "OpenCode" |
+| Tool definition prefixing  | Add `mcp_` prefix to `tools[].name`                                                                                                                                 | Required by Anthropic's OAuth API            |
+| Tool use prefixing         | Add `mcp_` prefix to `tool_use` blocks in `messages[].content`                                                                                                      | Matches the tool definition prefixes         |
+| Billing header injection   | `headers.billing_header` defaults to `true`; when enabled, prepend a standalone `x-anthropic-billing-header:` system text block to the final Anthropic request body | Claude-style attribution (configurable)      |
+| `cc_version` fingerprint   | Build `cc_version` as `<profile.ccVersion>.<fingerprint>` from the first user message using Claude Code OSS-confirmed semantics                                     | Match Claude Code OSS behavior               |
+| `cch` final signing        | Emit `cch=00000` first, then replace it at the final serialized Anthropic body boundary via `lib/cch-signing.mjs`                                                   | Match observed request-boundary behavior     |
 
 `cc_version` fingerprinting is Claude Code OSS-confirmed. The `cch` signing algorithm is reverse-engineered and remains hypothesis-based in documentation, even though it is implemented.
 

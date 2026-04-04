@@ -312,8 +312,8 @@ Configuration is stored at `~/.config/opencode/anthropic-auth.json`. All setting
     // Available: "claude-cli-default" (= "claude-cli-2.1.90"), "claude-cli-2.1.90", "claude-cli-2.1.80", "claude-cli-2.1.75", "claude-cli-2.1.50"
     "emulation_profile": "claude-cli-default",
 
-    // Optional Claude-style billing header block on Anthropic requests
-    "billing_header": false,
+    // Claude-style billing header block on Anthropic requests (enabled by default)
+    "billing_header": true,
 
     // Override any default spoofed header
     "overrides": {
@@ -356,9 +356,21 @@ OAuth token exchange and refresh now reuse the selected default Claude CLI user 
 - Baseline: `claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24`
 - Opus adds: `context-management-2025-06-27`
 
-### Optional billing header attribution
+### Billing header attribution
 
-`headers.billing_header` controls an optional Claude-style attribution block. It is **off by default**.
+`headers.billing_header` controls the Claude-style attribution block. It is **on by default**.
+
+If you are upgrading from an older version of this plugin, note that the
+default changed from `false` to `true`. To keep the previous behavior,
+explicitly set:
+
+```json
+{
+  "headers": {
+    "billing_header": false
+  }
+}
+```
 
 When enabled, the final Anthropic request body gets a standalone system text block in this format:
 
