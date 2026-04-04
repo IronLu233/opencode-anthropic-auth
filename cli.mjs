@@ -38,7 +38,7 @@ import {
   createDefaultStats,
   hasAccountsStorageFile,
 } from "./lib/storage.mjs";
-import { loadConfig, loadRawConfig, saveConfig, getConfigPath, VALID_STRATEGIES } from "./lib/config.mjs";
+import { loadConfig, saveConfig, getConfigPath, VALID_STRATEGIES } from "./lib/config.mjs";
 import { authorize, exchange, revoke } from "./lib/oauth.mjs";
 import {
   applyLoginCredentials,
@@ -1147,7 +1147,6 @@ function cmdConfigSet(keyArg, valueArg) {
   }
 
   // Build the update object, preserving existing nested keys
-  const raw = loadRawConfig();
   const oldConfig = loadConfig();
   const oldValue = getByPath(/** @type {Record<string, unknown>} */ (oldConfig), meta.path);
 
@@ -1156,10 +1155,14 @@ function cmdConfigSet(keyArg, valueArg) {
   if (meta.path.length === 1) {
     update = { [meta.path[0]]: parsed.value };
   } else {
-    // Deep: reconstruct the nested object preserving siblings
+    // Deep: reconstruct the nested object preserving validated siblings so
+    // stale/removed config values (like unsupported header profiles) are
+    // normalized away on the next write.
     const topKey = meta.path[0];
     const existing =
-      raw[topKey] && typeof raw[topKey] === "object" ? { .../** @type {Record<string, unknown>} */ (raw[topKey]) } : {};
+      oldConfig[topKey] && typeof oldConfig[topKey] === "object"
+        ? { .../** @type {Record<string, unknown>} */ (oldConfig[topKey]) }
+        : {};
     existing[meta.path[1]] = parsed.value;
     update = { [topKey]: existing };
   }

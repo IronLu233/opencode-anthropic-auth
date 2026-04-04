@@ -309,7 +309,7 @@ Configuration is stored at `~/.config/opencode/anthropic-auth.json`. All setting
 
   // Outbound request header emulation (Claude Code spoof profile)
   "headers": {
-    // Available: "claude-cli-default" (= "claude-cli-2.1.90"), "claude-cli-2.1.90", "claude-cli-2.1.80", "claude-cli-2.1.75", "claude-cli-2.1.50"
+    // Available: "claude-cli-default" (= "claude-cli-2.1.92"), "claude-cli-2.1.92", "claude-cli-2.1.90"
     "emulation_profile": "claude-cli-default",
 
     // Claude-style billing header block on Anthropic requests (enabled by default)
@@ -317,7 +317,7 @@ Configuration is stored at `~/.config/opencode/anthropic-auth.json`. All setting
 
     // Override any default spoofed header
     "overrides": {
-      // "user-agent": "claude-cli/2.1.75 (external, cli)"
+      // "user-agent": "claude-cli/2.1.92 (external, cli)"
       // "anthropic-beta": "custom-beta-a,custom-beta-b"
     },
 
@@ -338,14 +338,14 @@ Header override behavior:
 
 ### Default Emulation Profile
 
-The default profile is `claude-cli-2.1.90`, derived from Claude Code OSS v2.1.90. The `claude-cli-default` alias points to the same profile. Legacy profiles `claude-cli-2.1.80`, `claude-cli-2.1.75`, and `claude-cli-2.1.50` remain available as pinned alternatives.
+The default profile is `claude-cli-2.1.92`, derived from the installed Claude Code 2.1.92 binary. The `claude-cli-default` alias points to the same profile. `claude-cli-2.1.90` remains available as the only pinned compatibility alternative.
 
-`claude-cli-2.1.90` sends Claude Code-style headers, including:
+`claude-cli-2.1.92` sends Claude Code-style headers, including:
 
 - `accept: application/json`
 - `anthropic-version: 2023-06-01`
 - `anthropic-dangerous-direct-browser-access: true`
-- `user-agent: claude-cli/2.1.90 (external, cli)`
+- `user-agent: claude-cli/2.1.92 (external, cli)`
 - `x-app: cli`
 - `x-stainless-*` metadata headers (pinned values)
 

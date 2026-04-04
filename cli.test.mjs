@@ -1498,7 +1498,9 @@ describe("cmdConfig set", () => {
   it("sets a nested key (billing-header)", async () => {
     const code = await cmdConfig("set", "billing-header", "on");
     expect(code).toBe(0);
-    expect(saveConfigMock).toHaveBeenCalledWith({ headers: { billing_header: true } });
+    expect(saveConfigMock).toHaveBeenCalledWith({
+      headers: { emulation_profile: "claude-cli-2.1.92", overrides: {}, disable: [], billing_header: true },
+    });
     expect(output.text()).toContain("billing-header:");
   });
 
@@ -1511,17 +1513,32 @@ describe("cmdConfig set", () => {
   it("parses on/off as boolean", async () => {
     const code = await cmdConfig("set", "quiet", "off");
     expect(code).toBe(0);
-    expect(saveConfigMock).toHaveBeenCalledWith({ toasts: { quiet: false } });
+    expect(saveConfigMock).toHaveBeenCalledWith({ toasts: { quiet: false, debounce_seconds: 30 } });
   });
 
   it("preserves sibling keys in nested objects", async () => {
     vi.mocked(loadRawConfig).mockReturnValue({
-      headers: { emulation_profile: "custom", billing_header: false },
+      headers: { emulation_profile: "claude-cli-2.1.90", billing_header: false },
+    });
+    vi.mocked(loadConfig).mockReturnValue({
+      ...DEFAULT_CONFIG,
+      headers: { ...DEFAULT_CONFIG.headers, emulation_profile: "claude-cli-2.1.90", billing_header: false },
     });
     const code = await cmdConfig("set", "billing-header", "on");
     expect(code).toBe(0);
     expect(saveConfigMock).toHaveBeenCalledWith({
-      headers: { emulation_profile: "custom", billing_header: true },
+      headers: { emulation_profile: "claude-cli-2.1.90", overrides: {}, disable: [], billing_header: true },
+    });
+  });
+
+  it("normalizes removed header profiles when writing nested header settings", async () => {
+    vi.mocked(loadRawConfig).mockReturnValue({
+      headers: { emulation_profile: "claude-cli-2.1.80", billing_header: false },
+    });
+    const code = await cmdConfig("set", "billing-header", "on");
+    expect(code).toBe(0);
+    expect(saveConfigMock).toHaveBeenCalledWith({
+      headers: { emulation_profile: "claude-cli-2.1.92", billing_header: true, overrides: {}, disable: [] },
     });
   });
 

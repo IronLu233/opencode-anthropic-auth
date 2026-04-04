@@ -44,10 +44,11 @@ Verified available on this machine:
 - `/usr/bin/otool`
 - `/usr/bin/lldb`
 - `/opt/homebrew/bin/python3`
+- Ghidra 12.0.4 headless (`analyzeHeadless`)
 
 Optional but helpful:
 
-- Ghidra / Hopper / IDA / Binary Ninja
+- Hopper / IDA / Binary Ninja
 - `xxhash-wasm` for replay validation
 - a request proxy capture from a real Claude Code request
 
@@ -185,6 +186,22 @@ Even if symbol names disappear, the literal strings usually still survive:
 
 If all of those disappear, the build model likely changed significantly.
 
+### 2.5 Ghidra confirmation of JS-side artifacts
+
+Using a small headless Java Ghidra script against the installed binaries, the
+current Claude Code builds independently show the JS-side attribution artifacts
+inside the `__bun` memory block.
+
+For both `2.1.90` and `2.1.92`, Ghidra found:
+
+- `x-anthropic-billing-header:` — `3` matches in `__bun`
+- ` cch=00000;` — `3` matches in `__bun`
+- `59cf53e54c78` — `3` matches in `__bun`
+
+This confirms with an independent tool that the billing header string,
+placeholder model, and fingerprint salt are still embedded in the bundled JS
+blob inside the shipped binary.
+
 ---
 
 ## Phase 3: Confirm Fingerprint Algorithm Inputs
@@ -307,12 +324,24 @@ So the current seed is in:
 
 - `__TEXT,__const`
 
-### 4.3 Why this matters
+### 4.3 Ghidra confirmation of seed placement
+
+Ghidra headless independently located the current seed bytes in both binaries:
+
+| Version  | Ghidra Address | Block     |
+| -------- | -------------- | --------- |
+| `2.1.90` | `10365aa50`    | `__const` |
+| `2.1.92` | `1036629d0`    | `__const` |
+
+This confirms that the same 8-byte little-endian seed value still exists in
+native constant memory across both versions.
+
+### 4.4 Why this matters
 
 This tells you future seeds are likely to be recoverable by inspecting the
 constant pool, even if exact symbol names are gone.
 
-### 4.4 If you do **not** know the seed in advance
+### 4.5 If you do **not** know the seed in advance
 
 You can still use the current binary as a calibration target and then apply the
 same method to future binaries.
@@ -467,7 +496,7 @@ If multiple different bodies all match, confidence is high.
 
 ---
 
-## Phase 8: Current 2.1.90 Calibration Data
+## Phase 8: Current Calibration Data
 
 This is the calibration reference you can use to verify your extraction method.
 
@@ -475,13 +504,18 @@ This is the calibration reference you can use to verify your extraction method.
 
 | Field                      | Value                |
 | -------------------------- | -------------------- |
-| Version                    | `2.1.90`             |
+| Version (`2.1.90`)         | `2.1.90`             |
+| Version (`2.1.92`)         | `2.1.92`             |
 | Fingerprint salt           | `59cf53e54c78`       |
 | `cch` placeholder          | `00000`              |
 | Seed                       | `0x6E52736AC806831E` |
 | Seed bytes (little-endian) | `1e8306c86a73526e`   |
-| Seed section               | `__TEXT,__const`     |
-| Seed offset                | `56994384`           |
+| Seed section (`2.1.90`)    | `__TEXT,__const`     |
+| Seed offset (`2.1.90`)     | `56994384`           |
+| Ghidra address (`2.1.90`)  | `10365aa50`          |
+| Seed section (`2.1.92`)    | `__TEXT,__const`     |
+| Seed offset (`2.1.92`)     | `57027024`           |
+| Ghidra address (`2.1.92`)  | `1036629d0`          |
 
 ### 8.2 What to test your method against
 
@@ -570,6 +604,18 @@ otool -l "/path/to/claude-binary"
 lldb /path/to/claude-binary
 ```
 
+### Fast Ghidra headless check
+
+```bash
+JAVA_HOME="$(brew --prefix openjdk@21)/libexec/openjdk.jdk/Contents/Home" \
+  "$(brew --prefix ghidra)/libexec/support/analyzeHeadless" \
+  /tmp ghidra-attn-check \
+  -import /path/to/claude-binary \
+  -postScript InspectClaudeAttestation.java \
+  -scriptPath /path/to/.ghidra-scripts \
+  -noanalysis -deleteProject
+```
+
 ---
 
 ## Final Assessment
@@ -582,12 +628,14 @@ The reason is simple:
 2. The native seed is currently embedded as a plain constant in the binary.
 3. The replacement model is same-length and placeholder-based, which makes the
    native path highly traceable.
-4. We now have a calibration target (`2.1.90`) to test the workflow end to end.
+4. We now have calibration targets (`2.1.90` and `2.1.92`) to test the
+   workflow end to end.
 
 If Anthropic keeps the same overall architecture, we should be able to recover
 future version/salt/seed changes with this method.
 
 ---
 
-_Verified against the installed Claude Code binary at_
-`/Users/rmk/.local/share/claude/versions/2.1.90`.
+_Verified against the installed Claude Code binaries at_
+`/Users/rmk/.local/share/claude/versions/2.1.90` _and_
+`/Users/rmk/.local/share/claude/versions/2.1.92`.

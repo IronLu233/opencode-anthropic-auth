@@ -214,7 +214,7 @@ claude-cli/{MACRO.VERSION} ({USER_TYPE}, {entrypoint}{agentSdkVersion}{clientApp
 Example:
 
 ```
-claude-cli/2.1.90 (external, cli)
+claude-cli/2.1.92 (external, cli)
 ```
 
 Where:
@@ -266,7 +266,7 @@ x-anthropic-billing-header: cc_version={version}.{fingerprint}; cc_entrypoint={e
 
 Where:
 
-- `version` = `MACRO.VERSION` (compile-time constant, e.g. `2.1.90`)
+- `version` = `MACRO.VERSION` (compile-time constant, e.g. `2.1.92`)
 - `fingerprint` = 3-hex-char value from fingerprint algorithm (see section 4)
 - `entrypoint` = `process.env.CLAUDE_CODE_ENTRYPOINT ?? 'unknown'`
 - `cch` = only present when `feature('NATIVE_CLIENT_ATTESTATION')` is true
@@ -412,19 +412,51 @@ And:
 > We use a placeholder (instead of injecting from Zig) because same-length
 > replacement avoids Content-Length changes and buffer reallocation.
 
-### 5.2 What the OSS Code Does Not Show
+### 5.2 Ghidra-Backed Binary Confirmation
+
+Using Ghidra headless against the installed Claude Code binaries (`2.1.90` and
+`2.1.92`), the following were independently confirmed:
+
+#### Bundled JS artifacts in `__bun`
+
+For both binaries, Ghidra found:
+
+- `x-anthropic-billing-header:` — `3` matches in `__bun`
+- ` cch=00000;` — `3` matches in `__bun`
+- `59cf53e54c78` — `3` matches in `__bun`
+
+This confirms that the billing header string, placeholder model, and
+fingerprint salt are still embedded in the bundled JS blob inside the shipped
+binary.
+
+#### Native seed bytes in `__const`
+
+For the current known little-endian seed bytes `1e8306c86a73526e`, Ghidra
+found exactly one match in native constant memory for each binary:
+
+| Version  | Ghidra Address | Block     |
+| -------- | -------------- | --------- |
+| `2.1.90` | `10365aa50`    | `__const` |
+| `2.1.92` | `1036629d0`    | `__const` |
+
+This is stronger evidence than raw byte searching alone because Ghidra imports
+the Mach-O image and resolves the bytes in mapped memory blocks.
+
+### 5.3 What the OSS Code Does Not Show
 
 The actual hash computation is in `bun-anthropic/src/http/Attestation.zig`,
-which is **not present** in the Claude Code OSS repository. Therefore:
+which is **not present** in the Claude Code OSS repository. Therefore, even
+with the Ghidra-backed confirmation above, the following still cannot be proven
+from OSS plus lightweight binary inspection alone:
 
-- The exact algorithm (hash function, seed, masking) **cannot be verified**
-  from OSS alone
+- The exact algorithm family (e.g. definitive proof of `xxHash64`) **cannot be
+  verified** from OSS alone
 - The input to the hash (full body bytes, partial body, or other) **cannot be
   verified** from OSS alone
 - Whether the hash depends on signing keys, machine state, or build-time
   secrets **cannot be determined** from OSS alone
 
-### 5.3 What Is Known from the OSS Code
+### 5.4 What Is Known from the OSS Code
 
 From the placeholder mechanics:
 
@@ -434,7 +466,7 @@ From the placeholder mechanics:
 - It is a string search-and-replace, not structured JSON manipulation
 - The `cch=00000` pattern appears inside a `"text":"x-anthropic-billing-header:..."` JSON string value in the serialized body
 
-### 5.4 Third-Party Claim (Not OSS-Verified)
+### 5.5 Third-Party Claim (Not OSS-Verified)
 
 A third-party reverse-engineering claim asserts the following algorithm:
 

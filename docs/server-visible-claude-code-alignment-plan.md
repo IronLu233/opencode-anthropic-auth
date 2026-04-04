@@ -52,13 +52,13 @@ These are not “wire cosmetics”; they are behavior controls.
 
 ### Already matched by our current implementation
 
-- `User-Agent: claude-cli/2.1.90 (external, cli)`
+- `User-Agent: claude-cli/2.1.92 (external, cli)`
 - `Authorization: Bearer ...`
 - `anthropic-version: 2023-06-01`
 - `anthropic-dangerous-direct-browser-access: true`
 - `x-app: cli`
 - billing header in `system[0].text`
-- `cc_version=2.1.90.<fingerprint>`
+- `cc_version=2.1.92.<fingerprint>`
 - fingerprint algorithm
 - `cch` placeholder/signing for the currently captured requests
 
