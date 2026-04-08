@@ -55,7 +55,7 @@ Expected behavior:
   - `response_type=code`
   - `client_id=<CLIENT_ID>`
   - `redirect_uri=https://console.anthropic.com/oauth/code/callback`
-  - `scope=org:create_api_key user:profile user:inference`
+  - `scope=org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload`
   - `code_challenge=<sample challenge fixture or equivalent derived value>`
   - `code_challenge_method=S256`
   - `state=<verifier>`

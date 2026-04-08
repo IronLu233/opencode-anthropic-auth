@@ -609,13 +609,13 @@ could break what works.
 
 The browser navigates here. The server receives URL parameters.
 
-| Wire Property        | Claude Code Client                         | Our Client                                                  | Server Sees Difference?                                                                                                     |
-| -------------------- | ------------------------------------------ | ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| **Host**             | `platform.claude.com` or `claude.com/cai/` | `console.anthropic.com` or `claude.ai`                      | **Yes** — different hostnames.                                                                                              |
-| **`scope`**          | 6 scopes (union of console + claude.ai)    | 3 scopes (`org:create_api_key user:profile user:inference`) | **Yes** — server grants different scope sets. Missing: `user:sessions:claude_code`, `user:mcp_servers`, `user:file_upload`. |
-| **`state`**          | Random 43-char base64url                   | Verifier (43-char base64url)                                | Likely no — both are opaque 43-char strings. Server probably treats state as an opaque round-trip value.                    |
-| **`code=true`**      | Present                                    | Present                                                     | No                                                                                                                          |
-| **`code_challenge`** | S256 hash of verifier                      | S256 hash of verifier                                       | No                                                                                                                          |
+| Wire Property        | Claude Code Client                         | Our Client                              | Server Sees Difference?                                                                                  |
+| -------------------- | ------------------------------------------ | --------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| **Host**             | `platform.claude.com` or `claude.com/cai/` | `console.anthropic.com` or `claude.ai`  | **Yes** — different hostnames.                                                                           |
+| **`scope`**          | 6 scopes (union of console + claude.ai)    | 6 scopes (union of console + claude.ai) | **No** — aligned in WSA-04.                                                                              |
+| **`state`**          | Random 43-char base64url                   | Verifier (43-char base64url)            | Likely no — both are opaque 43-char strings. Server probably treats state as an opaque round-trip value. |
+| **`code=true`**      | Present                                    | Present                                 | No                                                                                                       |
+| **`code_challenge`** | S256 hash of verifier                      | S256 hash of verifier                   | No                                                                                                       |
 
 ### 7.3 API Endpoint (`POST /v1/messages`)
 
