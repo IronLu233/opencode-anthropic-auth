@@ -811,21 +811,8 @@ describe("fetch interceptor", () => {
     expect(headers.get("anthropic-beta")).toContain("redact-thinking-2026-02-12");
     expect(headers.get("anthropic-beta")).toContain("advanced-tool-use-2025-11-20");
     expect(headers.get("anthropic-beta")).not.toContain("adaptive-thinking-2026-01-28");
-    expect(headers.get("anthropic-beta")).not.toContain("context-management-2025-06-27");
+    expect(headers.get("anthropic-beta")).toContain("context-management-2025-06-27");
     expect(headers.has("x-api-key")).toBe(false);
-  });
-
-  it("adds Opus-only context-management beta for opus models", async () => {
-    mockFetch.mockResolvedValueOnce(new Response("", { status: 200 }));
-
-    await fetchFn("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: "claude-opus-4-1", messages: [] }),
-    });
-
-    const [, init] = mockFetch.mock.calls[0];
-    expect(init.headers.get("anthropic-beta")).toContain("context-management-2025-06-27");
   });
 
   it("adds ?beta=true to /v1/messages URL", async () => {
