@@ -736,6 +736,16 @@ describe("slash commands", () => {
 describe("fetch interceptor", () => {
   let client;
   let fetchFn;
+  const LEGACY_PROMPT_BLOCK = [
+    "You are OpenCode, the best coding agent on the planet.",
+    "",
+    "Legacy OpenCode system prompt body.",
+    "",
+    "<example>",
+    "user: Where are errors from the client handled?",
+    "assistant: Clients are marked as failed in `src/services/process.ts:712` inside `connectToServer`.",
+    "</example>",
+  ].join("\n");
 
   beforeEach(async () => {
     vi.resetAllMocks();
@@ -831,7 +841,7 @@ describe("fetch interceptor", () => {
     expect(url.searchParams.get("beta")).toBe("true");
   });
 
-  it("transforms system prompt: OpenCode → Claude Code, opencode → Claude", async () => {
+  it("preserves system prompt branding text in request body", async () => {
     mockFetch.mockResolvedValueOnce(new Response("", { status: 200 }));
 
     await fetchFn("https://api.anthropic.com/v1/messages", {
@@ -847,10 +857,10 @@ describe("fetch interceptor", () => {
     expect(body.system[0].text).toMatch(
       /^x-anthropic-billing-header: cc_version=[\d.a-z]+; cc_entrypoint=cli; cch=[0-9a-f]{5};$/,
     );
-    expect(body.system[1].text).toBe("You are Claude Code, an Claude assistant.");
+    expect(body.system[1].text).toBe("You are OpenCode, an opencode assistant.");
   });
 
-  it("strips OpenCode identity line from system prompt", async () => {
+  it("replaces a bounded legacy prompt block in system text entries", async () => {
     mockFetch.mockResolvedValueOnce(new Response("", { status: 200 }));
 
     await fetchFn("https://api.anthropic.com/v1/messages", {
@@ -859,7 +869,7 @@ describe("fetch interceptor", () => {
         system: [
           {
             type: "text",
-            text: "You are OpenCode, the best coding agent on the planet.\n\nYou are an interactive CLI tool.",
+            text: LEGACY_PROMPT_BLOCK,
           },
         ],
         messages: [],
@@ -868,9 +878,39 @@ describe("fetch interceptor", () => {
 
     const [, init] = mockFetch.mock.calls[0];
     const body = JSON.parse(init.body);
-    // Identity line stripped; remaining text still gets OpenCode->Claude Code rewrite
-    expect(body.system[1].text).not.toContain("best coding agent on the planet");
-    expect(body.system[1].text).toContain("You are an interactive CLI tool.");
+    expect(body.system[1].text).toBe(ANTHROPIC_REPLACEMENT_PROMPT);
+  });
+
+  it("replaces a bounded legacy prompt block when system is a plain string", async () => {
+    mockFetch.mockResolvedValueOnce(new Response("", { status: 200 }));
+
+    await fetchFn("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        system: LEGACY_PROMPT_BLOCK,
+        messages: [],
+      }),
+    });
+
+    const [, init] = mockFetch.mock.calls[0];
+    const body = JSON.parse(init.body);
+    expect(body.system[1].text).toBe(ANTHROPIC_REPLACEMENT_PROMPT);
+  });
+
+  it("replaces a fallback-bounded legacy prompt block in the fetch pipeline", async () => {
+    mockFetch.mockResolvedValueOnce(new Response("", { status: 200 }));
+
+    await fetchFn("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        system: `${LEGACY_PROMPT_BLOCK}\nInstructions from: /tmp/example.md`,
+        messages: [],
+      }),
+    });
+
+    const [, init] = mockFetch.mock.calls[0];
+    const body = JSON.parse(init.body);
+    expect(body.system[1].text).toBe(`${ANTHROPIC_REPLACEMENT_PROMPT}\nInstructions from: /tmp/example.md`);
   });
 
   it("preserves paths containing opencode in system prompt", async () => {
@@ -985,7 +1025,7 @@ describe("fetch interceptor", () => {
           type: "text",
           text: `x-anthropic-billing-header: cc_version=2.1.92.${computeBillingFingerprint("hello world", "2.1.92")}; cc_entrypoint=cli; cch=00000;`,
         },
-        { type: "text", text: "You are Claude Code, an Claude assistant." },
+        { type: "text", text: "You are OpenCode, an opencode assistant." },
       ],
       messages: [{ role: "user", content: "hello world" }],
       metadata: {
@@ -1241,7 +1281,7 @@ describe("fetch interceptor", () => {
           type: "text",
           text: `x-anthropic-billing-header: cc_version=2.1.92.${computeBillingFingerprint("hello world", "2.1.92")}; cc_entrypoint=cli; cch=00000;`,
         },
-        { type: "text", text: "You are Claude Code, an Claude assistant." },
+        { type: "text", text: "You are OpenCode, an opencode assistant." },
       ],
       messages: [{ role: "user", content: "hello world" }],
       metadata: {
@@ -1397,6 +1437,42 @@ describe("fetch interceptor", () => {
       method: "POST",
       body: JSON.stringify({
         system: "You are a helpful assistant.",
+        messages: [],
+      }),
+    });
+
+    const [, init] = mockFetch.mock.calls[0];
+    const body = JSON.parse(init.body);
+    expect(body.system).toHaveLength(2);
+    expect(body.system[0].text).toMatch(
+      /^x-anthropic-billing-header: cc_version=[\d.a-z]+; cc_entrypoint=cli; cch=[0-9a-f]{5};$/,
+    );
+    expect(body.system[1]).toEqual({ type: "text", text: "You are a helpful assistant." });
+  });
+
+  it("preserves string system instructions after removing an existing billing header line", async () => {
+    const { loadConfig } = await import("./lib/config.mjs");
+    loadConfig.mockReturnValue({
+      ...DEFAULT_CONFIG,
+      headers: { ...DEFAULT_CONFIG.headers, billing_header: true },
+    });
+
+    const plugin = await AnthropicAuthPlugin({ client });
+    const getAuth = vi.fn().mockResolvedValue({
+      type: "oauth",
+      refresh: "test-refresh",
+      access: "test-access",
+      expires: Date.now() + 3600_000,
+    });
+    const result = await plugin.auth.loader(getAuth, makeProvider());
+
+    mockFetch.mockResolvedValueOnce(new Response("", { status: 200 }));
+
+    await result.fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        system:
+          "x-anthropic-billing-header: cc_version=2.1.50.b97; cc_entrypoint=cli; cch=abcde;\nYou are a helpful assistant.",
         messages: [],
       }),
     });
