@@ -54,6 +54,7 @@
       "method": "POST",
       "url": "https://console.anthropic.com/v1/oauth/token",
       "headers": {
+        "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/x-www-form-urlencoded",
         "User-Agent": "claude-cli/<version> (external, cli)"
       },
@@ -88,6 +89,7 @@
       "method": "POST",
       "url": "https://console.anthropic.com/v1/oauth/token",
       "headers": {
+        "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/x-www-form-urlencoded",
         "User-Agent": "claude-cli/<version> (external, cli)"
       },
@@ -115,6 +117,7 @@
       "method": "POST",
       "url": "https://console.anthropic.com/v1/oauth/revoke",
       "headers": {
+        "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json"
       },
       "timeout_ms": 5000
