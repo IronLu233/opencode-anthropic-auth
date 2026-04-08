@@ -75,6 +75,7 @@ const mockFetch = vi.fn();
 vi.stubGlobal("fetch", mockFetch);
 
 import { AnthropicAuthPlugin } from "./index.mjs";
+import { ANTHROPIC_REPLACEMENT_PROMPT } from "./lib/anthropic-system-prompt.mjs";
 import { saveAccounts, loadAccounts, clearAccounts } from "./lib/storage.mjs";
 import { acquireRefreshLock, releaseRefreshLock } from "./lib/refresh-lock.mjs";
 import {
@@ -1768,6 +1769,16 @@ describe("fetch interceptor", () => {
 describe("system prompt transform", () => {
   const BILLING_RE = /^x-anthropic-billing-header: cc_version=[\d.a-z]+; cc_entrypoint=cli; cch=[0-9a-f]{5};$/;
   const PREFIX = "You are Claude Code, Anthropic's official CLI for Claude.";
+  const ORIGINAL_OPENCODE_PROMPT = [
+    "You are OpenCode, the best coding agent on the planet.",
+    "",
+    "Legacy OpenCode system prompt body.",
+    "",
+    "<example>",
+    "user: Where are errors from the client handled?",
+    "assistant: Clients are marked as failed in `src/services/process.ts:712` inside `connectToServer`.",
+    "</example>",
+  ].join("\n");
 
   it("prepends Claude Code prefix for anthropic provider", async () => {
     const client = makeClient();
@@ -1780,6 +1791,55 @@ describe("system prompt transform", () => {
     expect(output.system[0]).toBe(PREFIX);
     expect(output.system[1]).toBe("You are a helpful assistant.");
     expect(output.system.filter((item) => item === PREFIX)).toHaveLength(1);
+  });
+
+  it("replaces the bounded OpenCode prompt segment with the plugin-owned prompt", async () => {
+    const client = makeClient();
+    const plugin = await AnthropicAuthPlugin({ client });
+
+    const output = {
+      system: [ORIGINAL_OPENCODE_PROMPT],
+    };
+    plugin["experimental.chat.system.transform"]({ model: { providerID: "anthropic" } }, output);
+
+    expect(output.system[0]).toBe(PREFIX);
+    expect(output.system[1]).toBe(ANTHROPIC_REPLACEMENT_PROMPT);
+  });
+
+  it("replaces the bounded OpenCode prompt even when it is not the first system entry", async () => {
+    const client = makeClient();
+    const plugin = await AnthropicAuthPlugin({ client });
+
+    const output = {
+      system: [
+        "x-anthropic-billing-header: cc_version=2.1.50.b97; cc_entrypoint=cli; cch=abcde;",
+        ORIGINAL_OPENCODE_PROMPT,
+      ],
+    };
+    plugin["experimental.chat.system.transform"]({ model: { providerID: "anthropic" } }, output);
+
+    expect(output.system[0]).toBe(PREFIX);
+    expect(output.system[1]).toBe(ANTHROPIC_REPLACEMENT_PROMPT);
+    expect(output.system).toHaveLength(2);
+  });
+
+  it("does not replace the OpenCode prompt when the anthropic tail marker is missing", async () => {
+    const client = makeClient();
+    const plugin = await AnthropicAuthPlugin({ client });
+
+    const output = {
+      system: [
+        ["You are OpenCode, the best coding agent on the planet.", "", "Legacy OpenCode system prompt body."].join(
+          "\n",
+        ),
+      ],
+    };
+    plugin["experimental.chat.system.transform"]({ model: { providerID: "anthropic" } }, output);
+
+    expect(output.system[0]).toBe(PREFIX);
+    expect(output.system[1]).toBe(
+      ["You are OpenCode, the best coding agent on the planet.", "", "Legacy OpenCode system prompt body."].join("\n"),
+    );
   });
 
   it("deduplicates Claude Code prefix for anthropic provider", async () => {

@@ -32,6 +32,7 @@ import {
 import { stripAnsi } from "./lib/util.mjs";
 import { signSerializedBodyCch } from "./lib/cch-signing.mjs";
 import { injectServerVisibleMetadata, isAnthropicRequestUrl } from "./lib/server-visible-identity.mjs";
+import { replaceBoundedAnthropicSystemPrompt } from "./lib/anthropic-system-prompt.mjs";
 
 // ---------------------------------------------------------------------------
 // Account management CLI prompts
@@ -912,11 +913,20 @@ export async function AnthropicAuthPlugin({ client }) {
   }
 
   return {
-    // A1-A4: System prompt transform (unchanged)
+    // A1-A4: System prompt transform
     "experimental.chat.system.transform": (input, output) => {
       const prefix = "You are Claude Code, Anthropic's official CLI for Claude.";
       if (input.model?.providerID !== "anthropic") return;
       if (!Array.isArray(output.system)) return;
+
+      for (let i = 0; i < output.system.length; i++) {
+        if (typeof output.system[i] !== "string") continue;
+        const replaced = replaceBoundedAnthropicSystemPrompt(output.system[i]);
+        if (replaced !== output.system[i]) {
+          output.system[i] = replaced;
+          break;
+        }
+      }
 
       // Mutate in place — reassigning output.system breaks the caller's reference.
       // Remove exact matches of the prefix.
