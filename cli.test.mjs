@@ -1459,6 +1459,8 @@ describe("cmdConfig", () => {
     expect(text).toContain("Headers");
     expect(text).toContain("Billing header:");
     expect(text).toContain("Billing header:  on");
+    expect(text).toContain("CCH signing:");
+    expect(text).toContain("CCH signing:     off");
   });
 
   it("rejects unknown subcommands", async () => {
@@ -1499,9 +1501,30 @@ describe("cmdConfig set", () => {
     const code = await cmdConfig("set", "billing-header", "on");
     expect(code).toBe(0);
     expect(saveConfigMock).toHaveBeenCalledWith({
-      headers: { emulation_profile: "claude-cli-2.1.92", overrides: {}, disable: [], billing_header: true },
+      headers: {
+        emulation_profile: "claude-cli-2.1.97",
+        overrides: {},
+        disable: [],
+        billing_header: true,
+        cch_signing: false,
+      },
     });
     expect(output.text()).toContain("billing-header:");
+  });
+
+  it("sets a nested key (cch-signing)", async () => {
+    const code = await cmdConfig("set", "cch-signing", "off");
+    expect(code).toBe(0);
+    expect(saveConfigMock).toHaveBeenCalledWith({
+      headers: {
+        emulation_profile: "claude-cli-2.1.97",
+        overrides: {},
+        disable: [],
+        billing_header: true,
+        cch_signing: false,
+      },
+    });
+    expect(output.text()).toContain("cch-signing:");
   });
 
   it("supports key=value format", async () => {
@@ -1527,7 +1550,13 @@ describe("cmdConfig set", () => {
     const code = await cmdConfig("set", "billing-header", "on");
     expect(code).toBe(0);
     expect(saveConfigMock).toHaveBeenCalledWith({
-      headers: { emulation_profile: "claude-cli-2.1.90", overrides: {}, disable: [], billing_header: true },
+      headers: {
+        emulation_profile: "claude-cli-2.1.90",
+        overrides: {},
+        disable: [],
+        billing_header: true,
+        cch_signing: false,
+      },
     });
   });
 
@@ -1538,7 +1567,13 @@ describe("cmdConfig set", () => {
     const code = await cmdConfig("set", "billing-header", "on");
     expect(code).toBe(0);
     expect(saveConfigMock).toHaveBeenCalledWith({
-      headers: { emulation_profile: "claude-cli-2.1.92", billing_header: true, overrides: {}, disable: [] },
+      headers: {
+        emulation_profile: "claude-cli-2.1.97",
+        billing_header: true,
+        cch_signing: false,
+        overrides: {},
+        disable: [],
+      },
     });
   });
 

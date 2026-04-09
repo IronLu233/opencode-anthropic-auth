@@ -1050,6 +1050,7 @@ export async function cmdReset(arg) {
  */
 const SETTABLE_KEYS = {
   "billing-header": { path: ["headers", "billing_header"], type: "boolean" },
+  "cch-signing": { path: ["headers", "cch_signing"], type: "boolean" },
   debug: { path: ["debug"], type: "boolean" },
   quiet: { path: ["toasts", "quiet"], type: "boolean" },
   strategy: { path: ["account_selection_strategy"], type: "string", validate: (v) => VALID_STRATEGIES.includes(v) },
@@ -1223,6 +1224,7 @@ export async function cmdConfig(...args) {
   console.log(c.dim("Headers"));
   console.log(c.dim("  Profile:         ") + c.cyan(config.headers.emulation_profile));
   console.log(c.dim("  Billing header:  ") + (config.headers.billing_header ? c.yellow("on") : c.dim("off")));
+  console.log(c.dim("  CCH signing:     ") + (config.headers.cch_signing ? c.yellow("on") : c.dim("off")));
   if (config.headers.disable.length > 0) {
     console.log(c.dim("  Disabled:        ") + config.headers.disable.join(", "));
   }

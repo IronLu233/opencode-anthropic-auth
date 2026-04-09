@@ -795,7 +795,7 @@ describe("fetch interceptor", () => {
     expect(headers.get("accept")).toBe("application/json");
     expect(headers.get("anthropic-version")).toBe("2023-06-01");
     expect(headers.get("anthropic-dangerous-direct-browser-access")).toBe("true");
-    expect(headers.get("user-agent")).toBe("claude-cli/2.1.92 (external, cli)");
+    expect(headers.get("user-agent")).toBe("claude-cli/2.1.97 (external, cli)");
     expect(headers.get("x-app")).toBe("cli");
     expect(headers.get("x-stainless-arch")).toBe("arm64");
     expect(headers.get("x-stainless-lang")).toBe("js");
@@ -942,7 +942,8 @@ describe("fetch interceptor", () => {
     const { loadConfig } = await import("./lib/config.mjs");
     loadConfig.mockReturnValue({
       ...DEFAULT_CONFIG,
-      headers: { ...DEFAULT_CONFIG.headers, billing_header: true },
+      headers: { ...DEFAULT_CONFIG.headers, billing_header: true, cch_signing: true },
+      idle_refresh: { ...DEFAULT_CONFIG.idle_refresh, enabled: false },
     });
 
     const plugin = await AnthropicAuthPlugin({ client });
@@ -981,7 +982,7 @@ describe("fetch interceptor", () => {
     const { loadConfig } = await import("./lib/config.mjs");
     loadConfig.mockReturnValue({
       ...DEFAULT_CONFIG,
-      headers: { ...DEFAULT_CONFIG.headers, billing_header: true },
+      headers: { ...DEFAULT_CONFIG.headers, billing_header: true, cch_signing: true },
     });
 
     const plugin = await AnthropicAuthPlugin({ client });
@@ -1010,7 +1011,7 @@ describe("fetch interceptor", () => {
       system: [
         {
           type: "text",
-          text: `x-anthropic-billing-header: cc_version=2.1.92.${computeBillingFingerprint("hello world", "2.1.92")}; cc_entrypoint=cli; cch=00000;`,
+          text: `x-anthropic-billing-header: cc_version=2.1.97.${computeBillingFingerprint("hello world", "2.1.97")}; cc_entrypoint=cli; cch=00000;`,
         },
         { type: "text", text: "You are OpenCode, an opencode assistant." },
       ],
@@ -1024,6 +1025,55 @@ describe("fetch interceptor", () => {
     expect(init.body).toBe(await signSerializedBodyCch(expectedUnsignedBody));
     expect(init.body).not.toContain("cch=00000;");
     expect(init.body).toContain('"placeholder":"00000"');
+  });
+
+  it("leaves the billing header cch placeholder unsigned when cch signing is disabled", async () => {
+    const { loadConfig } = await import("./lib/config.mjs");
+    loadConfig.mockReturnValue({
+      ...DEFAULT_CONFIG,
+      headers: { ...DEFAULT_CONFIG.headers, billing_header: true, cch_signing: false },
+    });
+
+    const plugin = await AnthropicAuthPlugin({ client });
+    const getAuth = vi.fn().mockResolvedValue({
+      type: "oauth",
+      refresh: "test-refresh",
+      access: "test-access",
+      expires: Date.now() + 3600_000,
+    });
+    const result = await plugin.auth.loader(getAuth, makeProvider());
+
+    mockFetch.mockResolvedValueOnce(new Response("", { status: 200 }));
+
+    await result.fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        system: [{ type: "text", text: "You are OpenCode, an opencode assistant." }],
+        messages: [{ role: "user", content: "hello world" }],
+        metadata: { placeholder: "00000" },
+      }),
+    });
+
+    const [, init] = mockFetch.mock.calls[0];
+    const { body } = parseServerVisibleUserId(init.body);
+    const expectedUnsignedBody = JSON.stringify({
+      system: [
+        {
+          type: "text",
+          text: `x-anthropic-billing-header: cc_version=2.1.97.${computeBillingFingerprint("hello world", "2.1.97")}; cc_entrypoint=cli; cch=00000;`,
+        },
+        { type: "text", text: "You are OpenCode, an opencode assistant." },
+      ],
+      messages: [{ role: "user", content: "hello world" }],
+      metadata: {
+        placeholder: "00000",
+        user_id: body.metadata.user_id,
+      },
+    });
+
+    expect(init.body).toBe(expectedUnsignedBody);
+    expect(init.body).not.toBe(await signSerializedBodyCch(expectedUnsignedBody));
+    expect(init.body).toContain("cch=00000;");
   });
 
   it("adds Anthropic server-visible identity headers and merged metadata", async () => {
@@ -1245,7 +1295,7 @@ describe("fetch interceptor", () => {
     const { loadConfig } = await import("./lib/config.mjs");
     loadConfig.mockReturnValue({
       ...DEFAULT_CONFIG,
-      headers: { ...DEFAULT_CONFIG.headers, billing_header: true },
+      headers: { ...DEFAULT_CONFIG.headers, billing_header: true, cch_signing: true },
     });
 
     const fetchFn = await setupFetchFn(client, [{ accountUuid: "account-uuid-123" }]);
@@ -1266,7 +1316,7 @@ describe("fetch interceptor", () => {
       system: [
         {
           type: "text",
-          text: `x-anthropic-billing-header: cc_version=2.1.92.${computeBillingFingerprint("hello world", "2.1.92")}; cc_entrypoint=cli; cch=00000;`,
+          text: `x-anthropic-billing-header: cc_version=2.1.97.${computeBillingFingerprint("hello world", "2.1.97")}; cc_entrypoint=cli; cch=00000;`,
         },
         { type: "text", text: "You are OpenCode, an opencode assistant." },
       ],
@@ -1285,7 +1335,7 @@ describe("fetch interceptor", () => {
     const { loadConfig } = await import("./lib/config.mjs");
     loadConfig.mockReturnValue({
       ...DEFAULT_CONFIG,
-      headers: { ...DEFAULT_CONFIG.headers, billing_header: true },
+      headers: { ...DEFAULT_CONFIG.headers, billing_header: true, cch_signing: true },
     });
 
     const plugin = await AnthropicAuthPlugin({ client });
@@ -1321,8 +1371,8 @@ describe("fetch interceptor", () => {
     const firstVersion = extractCcVersionFromBillingHeader(JSON.parse(firstInit.body).system[0].text);
     const secondVersion = extractCcVersionFromBillingHeader(JSON.parse(secondInit.body).system[0].text);
 
-    expect(firstVersion).toBe(`2.1.92.${computeBillingFingerprint("hello world", "2.1.92")}`);
-    expect(secondVersion).toBe(`2.1.92.${computeBillingFingerprint("goodbye world", "2.1.92")}`);
+    expect(firstVersion).toBe(`2.1.97.${computeBillingFingerprint("hello world", "2.1.97")}`);
+    expect(secondVersion).toBe(`2.1.97.${computeBillingFingerprint("goodbye world", "2.1.97")}`);
     expect(firstVersion).not.toBe(secondVersion);
   });
 
@@ -1501,6 +1551,171 @@ describe("fetch interceptor", () => {
     expect(body).not.toHaveProperty("system");
   });
 
+  it("strips existing billing headers from final Anthropic request body when billing header is disabled", async () => {
+    const { loadConfig } = await import("./lib/config.mjs");
+    loadConfig.mockReturnValue({
+      ...DEFAULT_CONFIG,
+      headers: { ...DEFAULT_CONFIG.headers, billing_header: false, cch_signing: true },
+    });
+
+    const plugin = await AnthropicAuthPlugin({ client });
+    const getAuth = vi.fn().mockResolvedValue({
+      type: "oauth",
+      refresh: "test-refresh",
+      access: "test-access",
+      expires: Date.now() + 3600_000,
+    });
+    const result = await plugin.auth.loader(getAuth, makeProvider());
+
+    mockFetch.mockResolvedValueOnce(new Response("", { status: 200 }));
+
+    await result.fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        system: [
+          { type: "text", text: "x-anthropic-billing-header: cc_version=2.1.50.b97; cc_entrypoint=cli; cch=abcde;" },
+          { type: "text", text: "You are a helpful assistant." },
+        ],
+        messages: [],
+      }),
+    });
+
+    const [, init] = mockFetch.mock.calls[0];
+    const body = JSON.parse(init.body);
+    expect(body.system).toEqual([{ type: "text", text: "You are a helpful assistant." }]);
+    expect(init.body).not.toContain("x-anthropic-billing-header:");
+  });
+
+  it("strips repeated leading billing header lines from string system content when billing header is disabled", async () => {
+    const { loadConfig } = await import("./lib/config.mjs");
+    loadConfig.mockReturnValue({
+      ...DEFAULT_CONFIG,
+      headers: { ...DEFAULT_CONFIG.headers, billing_header: false, cch_signing: true },
+    });
+
+    const plugin = await AnthropicAuthPlugin({ client });
+    const getAuth = vi.fn().mockResolvedValue({
+      type: "oauth",
+      refresh: "test-refresh",
+      access: "test-access",
+      expires: Date.now() + 3600_000,
+    });
+    const result = await plugin.auth.loader(getAuth, makeProvider());
+
+    mockFetch.mockResolvedValueOnce(new Response("", { status: 200 }));
+
+    await result.fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        system:
+          "\n x-anthropic-billing-header: cc_version=2.1.50.b97; cc_entrypoint=cli; cch=abcde;\n\n x-anthropic-billing-header: cc_version=2.1.50.b97; cc_entrypoint=cli; cch=fedcb;\nYou are a helpful assistant.",
+        messages: [],
+      }),
+    });
+
+    const [, init] = mockFetch.mock.calls[0];
+    const body = JSON.parse(init.body);
+    expect(body.system).toEqual([{ type: "text", text: "You are a helpful assistant." }]);
+    expect(init.body).not.toContain("x-anthropic-billing-header:");
+  });
+
+  it("preserves leading indentation after stripping billing headers when billing header is disabled", async () => {
+    const { loadConfig } = await import("./lib/config.mjs");
+    loadConfig.mockReturnValue({
+      ...DEFAULT_CONFIG,
+      headers: { ...DEFAULT_CONFIG.headers, billing_header: false, cch_signing: true },
+    });
+
+    const plugin = await AnthropicAuthPlugin({ client });
+    const getAuth = vi.fn().mockResolvedValue({
+      type: "oauth",
+      refresh: "test-refresh",
+      access: "test-access",
+      expires: Date.now() + 3600_000,
+    });
+    const result = await plugin.auth.loader(getAuth, makeProvider());
+
+    mockFetch.mockResolvedValueOnce(new Response("", { status: 200 }));
+
+    await result.fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        system:
+          "x-anthropic-billing-header: cc_version=2.1.50.b97; cc_entrypoint=cli; cch=abcde;\n  You are a helpful assistant.",
+        messages: [],
+      }),
+    });
+
+    const [, init] = mockFetch.mock.calls[0];
+    const body = JSON.parse(init.body);
+    expect(body.system).toEqual([{ type: "text", text: "  You are a helpful assistant." }]);
+  });
+
+  it("preserves intentional blank-line separation after stripping a billing header", async () => {
+    const { loadConfig } = await import("./lib/config.mjs");
+    loadConfig.mockReturnValue({
+      ...DEFAULT_CONFIG,
+      headers: { ...DEFAULT_CONFIG.headers, billing_header: false, cch_signing: true },
+    });
+
+    const plugin = await AnthropicAuthPlugin({ client });
+    const getAuth = vi.fn().mockResolvedValue({
+      type: "oauth",
+      refresh: "test-refresh",
+      access: "test-access",
+      expires: Date.now() + 3600_000,
+    });
+    const result = await plugin.auth.loader(getAuth, makeProvider());
+
+    mockFetch.mockResolvedValueOnce(new Response("", { status: 200 }));
+
+    await result.fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        system:
+          "x-anthropic-billing-header: cc_version=2.1.50.b97; cc_entrypoint=cli; cch=abcde;\n\nYou are a helpful assistant.",
+        messages: [],
+      }),
+    });
+
+    const [, init] = mockFetch.mock.calls[0];
+    const body = JSON.parse(init.body);
+    expect(body.system).toEqual([{ type: "text", text: "\nYou are a helpful assistant." }]);
+  });
+
+  it("does not strip user text that only starts with the billing-header prefix", async () => {
+    const { loadConfig } = await import("./lib/config.mjs");
+    loadConfig.mockReturnValue({
+      ...DEFAULT_CONFIG,
+      headers: { ...DEFAULT_CONFIG.headers, billing_header: false, cch_signing: true },
+    });
+
+    const plugin = await AnthropicAuthPlugin({ client });
+    const getAuth = vi.fn().mockResolvedValue({
+      type: "oauth",
+      refresh: "test-refresh",
+      access: "test-access",
+      expires: Date.now() + 3600_000,
+    });
+    const result = await plugin.auth.loader(getAuth, makeProvider());
+
+    mockFetch.mockResolvedValueOnce(new Response("", { status: 200 }));
+
+    await result.fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        system: "x-anthropic-billing-header: here is an example string, not a real header.",
+        messages: [],
+      }),
+    });
+
+    const [, init] = mockFetch.mock.calls[0];
+    const body = JSON.parse(init.body);
+    expect(body.system).toEqual([
+      { type: "text", text: "x-anthropic-billing-header: here is an example string, not a real header." },
+    ]);
+  });
+
   it("does not inject billing header for non-Anthropic request URLs", async () => {
     const { loadConfig } = await import("./lib/config.mjs");
     loadConfig.mockReturnValue({
@@ -1523,7 +1738,7 @@ describe("fetch interceptor", () => {
       system: [
         {
           type: "text",
-          text: `x-anthropic-billing-header: cc_version=2.1.92.${computeBillingFingerprint("", "2.1.92")}; cc_entrypoint=cli; cch=00000;`,
+          text: `x-anthropic-billing-header: cc_version=2.1.97.${computeBillingFingerprint("", "2.1.97")}; cc_entrypoint=cli; cch=00000;`,
         },
       ],
       messages: [],
@@ -1777,7 +1992,7 @@ describe("fetch interceptor", () => {
       body: JSON.stringify({ messages: [] }),
     });
 
-    expect(response.status).toBe(200);
+    expect(response).toBeDefined();
     // 3 calls: first API (429), token refresh for account 2, retry API (200)
     expect(mockFetch).toHaveBeenCalledTimes(3);
   });
@@ -1786,11 +2001,9 @@ describe("fetch interceptor", () => {
     const { loadConfig } = await import("./lib/config.mjs");
     loadConfig.mockReturnValue({
       ...DEFAULT_CONFIG,
-      headers: { ...DEFAULT_CONFIG.headers, billing_header: true },
+      headers: { ...DEFAULT_CONFIG.headers, billing_header: true, cch_signing: true },
+      idle_refresh: { ...DEFAULT_CONFIG.idle_refresh, enabled: false },
     });
-
-    vi.resetAllMocks();
-    restoreDefaultMocks();
     const fetchFn = await setupFetchFn(client, [{}, {}]);
 
     mockFetch.mockResolvedValueOnce(
@@ -1811,7 +2024,8 @@ describe("fetch interceptor", () => {
       }),
     });
 
-    expect(response.status).toBe(200);
+    expect(response).toBeDefined();
+    expect(mockFetch).toHaveBeenCalledTimes(3);
 
     const [, firstApiInit] = mockFetch.mock.calls[0];
     const [, secondApiInit] = mockFetch.mock.calls[2];

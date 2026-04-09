@@ -1215,7 +1215,9 @@ export async function AnthropicAuthPlugin({ client }) {
                     sessionId: requestHeaders.get("x-claude-code-session-id") ?? undefined,
                   });
                   const body =
-                    isAnthropicRequestUrl(requestUrl) && typeof requestBodyWithIdentity === "string"
+                    isAnthropicRequestUrl(requestUrl) &&
+                    config.headers.cch_signing &&
+                    typeof requestBodyWithIdentity === "string"
                       ? await signSerializedBodyCch(requestBodyWithIdentity)
                       : requestBodyWithIdentity;
 
