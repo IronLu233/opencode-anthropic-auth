@@ -1,6 +1,7 @@
 {
   "name": "opencode-anthropic-auth",
   "version": "2.0.1",
+  "description": "OpenCode plugin that disguises Anthropic requests as Claude Code CLI traffic.",
   "main": "./index.mjs",
   "scripts": {
     "build": "node scripts/build.mjs",
