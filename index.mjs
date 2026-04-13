@@ -7,6 +7,9 @@ import {
 } from "./lib/request-transform.mjs";
 import { transformResponse, isEventStreamResponse } from "./lib/sse-stream.mjs";
 import { getBestEffortDeviceId } from "./lib/server-visible-identity.mjs";
+import { writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
 
 /**
  * @param {any} input
@@ -85,6 +88,39 @@ export async function AnthropicAuthPlugin() {
               requestUrl,
               isStreamingRequest(originalBody, requestInit),
             );
+
+            // Dump captured request for debugging
+            if (config.debug) {
+              try {
+                const dumpDir = join(homedir(), ".config", "opencode", "request-captures");
+                if (!existsSync(dumpDir)) mkdirSync(dumpDir, { recursive: true });
+                const ts = new Date().toISOString().replace(/[:.]/g, "-");
+                const parsedBody = body ? JSON.parse(body) : null;
+                const toolNames = (parsedBody?.tools || []).map((t) => t.name);
+                const suffix =
+                  toolNames.length > 0 ? toolNames.slice(0, 3).join("+") + `(${toolNames.length})` : "notools";
+                const filename = `${ts}_${modelName || "unknown"}_${suffix}.json`;
+                const capture = {
+                  url: String(requestUrl),
+                  method: requestInit.method || "POST",
+                  headers: Object.fromEntries(
+                    headers instanceof Headers ? headers.entries() : Object.entries(headers || {}),
+                  ),
+                  body: parsedBody,
+                  _meta: {
+                    toolNames,
+                    toolCount: toolNames.length,
+                    model: modelName,
+                    timestamp: ts,
+                    systemBlockCount: parsedBody?.system?.length || 0,
+                    messageCount: parsedBody?.messages?.length || 0,
+                  },
+                };
+                writeFileSync(join(dumpDir, filename), JSON.stringify(capture, null, 2));
+              } catch {
+                // dump failures must never break the request
+              }
+            }
 
             const response = await fetch(requestInput, {
               method: requestInit.method || "POST",
