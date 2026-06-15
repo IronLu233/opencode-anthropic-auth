@@ -9,6 +9,10 @@ const config = {
     billing_header: true,
     cch_signing: false,
   },
+  stream: {
+    close_on_message_stop: true,
+    idle_timeout_seconds: 180,
+  },
 };
 
 vi.mock("./lib/config.mjs", async (importOriginal) => {

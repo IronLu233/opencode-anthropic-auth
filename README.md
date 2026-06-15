@@ -278,9 +278,6 @@ Configuration is stored at `~/.config/opencode/anthropic-auth.json`. All setting
   // Seconds before consecutive failure count resets (60-7200)
   "failure_ttl_seconds": 3600,
 
-  // Enable debug logging
-  "debug": false,
-
   // Health score tuning (0-100 scale)
   "health_score": {
     "initial": 70,
@@ -397,7 +394,6 @@ Transport-managed headers (such as `host`, `content-length`, `connection`, `acce
 | Variable                      | Description                                                          |
 | ----------------------------- | -------------------------------------------------------------------- |
 | `OPENCODE_ANTHROPIC_STRATEGY` | Override the account selection strategy at runtime.                  |
-| `OPENCODE_ANTHROPIC_DEBUG`    | Set to `1` to enable debug logging.                                  |
 | `OPENCODE_ANTHROPIC_QUIET`    | Set to `1` to suppress non-error toasts (account status, switching). |
 
 ## How It Works
